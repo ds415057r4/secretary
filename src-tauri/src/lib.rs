@@ -679,6 +679,12 @@ fn save_local(app: &AppHandle, key: &[u8; 32], kdf: KdfConfig, vault: &Vault) ->
     Ok(())
 }
 
+fn prepare_restored_vault(mut imported: Vault, mut local: Vault) -> (Vault, usize) {
+    imported.backup = std::mem::take(&mut local.backup);
+    let restored_entries = imported.entries.len();
+    (imported, restored_entries)
+}
+
 fn write_automatic_file_backup(vault: &Vault, key: &[u8; 32], kdf: KdfConfig) -> CommandResult<()> {
     let directory = PathBuf::from(&vault.backup.directory);
     if !directory.is_dir() {
@@ -1895,7 +1901,7 @@ async fn import_backup(
     window: WebviewWindow,
     state: State<'_, AppState>,
     password: String,
-) -> CommandResult<bool> {
+) -> CommandResult<Option<usize>> {
     require_window(&window, "main")?;
     let password = Zeroizing::new(password);
     let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -1909,7 +1915,7 @@ async fn import_backup(
         .await
         .map_err(|_| "백업 파일 선택 창의 응답을 받지 못했습니다.".to_string())?;
     let Some(path) = selected else {
-        return Ok(false);
+        return Ok(None);
     };
     let path = path
         .into_path()
@@ -1917,11 +1923,14 @@ async fn import_backup(
     let backup = read_envelope(&path)?;
     let backup_key = derive_key(password.as_bytes(), &backup.kdf)?;
     let imported = decrypt_vault(&backup, &backup_key, "backup")?;
-    with_session(&state, |current_key| {
-        let local = read_envelope(&vault_path(&app)?)?;
-        save_local(&app, current_key, local.kdf, &imported)
+    let restored_entries = with_session(&state, |current_key| {
+        let (local, local_kdf) = load_local(&app, current_key)?;
+        let (restored, restored_entries) = prepare_restored_vault(imported, local);
+        let envelope = encrypt_vault(&restored, current_key, local_kdf, "vault")?;
+        atomic_write(&vault_path(&app)?, &envelope)?;
+        Ok(restored_entries)
     })?;
-    Ok(true)
+    Ok(Some(restored_entries))
 }
 
 #[tauri::command]
@@ -2126,6 +2135,45 @@ mod tests {
         assert!(decrypt_vault(&envelope, &key, "vault").is_ok());
         envelope.ciphertext.push('A');
         assert!(decrypt_vault(&envelope, &key, "vault").is_err());
+    }
+
+    #[test]
+    fn restore_replaces_entries_but_keeps_local_backup_settings() {
+        let imported = Vault {
+            entries: vec![OtpEntry {
+                id: Uuid::new_v4(),
+                issuer: "GitHub".into(),
+                account: "octocat".into(),
+                secret: "JBSWY3DPEHPK3PXP".into(),
+                algorithm: TotpAlgorithm::Sha1,
+                digits: 6,
+                period: 30,
+                icon: None,
+                brand_icon: Some("github".into()),
+                favorite: true,
+            }],
+            backup: BackupSettings {
+                automatic_file: true,
+                directory: "missing-remote-folder".into(),
+                retention: 99,
+            },
+        };
+        let local = Vault {
+            entries: vec![],
+            backup: BackupSettings {
+                automatic_file: false,
+                directory: "local-folder".into(),
+                retention: 7,
+            },
+        };
+
+        let (restored, count) = prepare_restored_vault(imported, local);
+
+        assert_eq!(count, 1);
+        assert_eq!(restored.entries[0].issuer, "GitHub");
+        assert!(!restored.backup.automatic_file);
+        assert_eq!(restored.backup.directory, "local-folder");
+        assert_eq!(restored.backup.retention, 7);
     }
 
     #[test]

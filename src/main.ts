@@ -817,12 +817,22 @@ function backupDialog(mode: "export" | "import") {
     e.preventDefault();
     submit.disabled = true;
     try {
-      const result = await invoke<boolean>(mode === "export" ? "export_backup" : "import_backup", { password: pw.value });
-      pw.value = "";
-      if (result) {
-        dialog.remove();
-        if (mode === "import") await refreshCodes();
-        toast(mode === "export" ? "암호화 백업을 저장했습니다." : "백업을 복구했습니다.");
+      if (mode === "export") {
+        const saved = await invoke<boolean>("export_backup", { password: pw.value });
+        pw.value = "";
+        if (saved) {
+          dialog.remove();
+          toast("암호화 백업을 저장했습니다.");
+        }
+      } else {
+        const restoredEntries = await invoke<number | null>("import_backup", { password: pw.value });
+        pw.value = "";
+        if (restoredEntries !== null) {
+          dialog.remove();
+          searchQuery = "";
+          await refreshCodes();
+          toast(`백업에서 인증키 ${restoredEntries}개를 복구했습니다.`);
+        }
       }
     } catch (error) { toast(String(error), "error"); }
     finally { submit.disabled = false; }
