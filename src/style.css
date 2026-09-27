@@ -43,6 +43,14 @@ input, textarea { width: 100%; padding: 10px 12px; color: white; background: var
 input { min-height: 42px; }
 textarea { min-height: 128px; resize: vertical; font-size: 13px; line-height: 1.55; }
 input:focus, textarea:focus { border-color: var(--hairline-strong); }
+.password-field { position: relative; width: 100%; }
+.password-field input { padding-left: 39px; padding-right: 40px; }
+.password-field-icon { position: absolute; z-index: 1; left: 12px; top: 50%; width: 17px; height: 17px; display: grid; place-items: center; color: var(--ash); transform: translateY(-50%); pointer-events: none; }
+.password-field-icon .symbol, .password-visibility .symbol { width: 16px; height: 16px; }
+.password-field:focus-within .password-field-icon { color: var(--mute); }
+.password-visibility { position: absolute; z-index: 1; top: 50%; right: 7px; width: 30px; height: 30px; padding: 0; display: grid; place-items: center; color: var(--ash); background: transparent; border: 0; border-radius: 6px; transform: translateY(-50%); }
+.password-visibility:active { color: white; background: var(--card); }
+.password-visibility:focus-visible { outline: 1px solid var(--hairline-strong); outline-offset: -2px; }
 
 .primary, .ghost { min-height: 36px; padding: 7px 15px; border: 1px solid transparent; border-radius: 8px; font-size: 14px; font-weight: 520; letter-spacing: .1px; }
 .primary:has(.symbol), .ghost:has(.symbol), .header-lock { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }

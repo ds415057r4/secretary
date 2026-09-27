@@ -8,6 +8,8 @@ import {
   Copy,
   Dices,
   Download,
+  Eye,
+  EyeOff,
   FolderClock,
   Fingerprint,
   ImagePlus,
@@ -119,6 +121,36 @@ function icon(node: IconNode, className = "symbol") {
   const svg = createLucideIcon(node, { width: 18, height: 18, "aria-hidden": "true" });
   svg.classList.add(className);
   return svg;
+}
+
+function passwordField(placeholder: string, autocomplete: AutoFill, minLength?: number) {
+  const field = el("div", "password-field");
+  const leading = el("span", "password-field-icon");
+  leading.append(icon(LockKeyhole));
+  const input = el("input") as HTMLInputElement;
+  input.type = "password";
+  input.autocomplete = autocomplete;
+  input.placeholder = placeholder;
+  input.required = true;
+  if (minLength !== undefined) input.minLength = minLength;
+  const visibility = el("button", "password-visibility") as HTMLButtonElement;
+  visibility.type = "button";
+  const updateVisibility = (visible: boolean) => {
+    input.type = visible ? "text" : "password";
+    visibility.replaceChildren(icon(visible ? EyeOff : Eye));
+    visibility.setAttribute("aria-label", visible ? "암호 숨기기" : "암호 표시");
+    visibility.title = visible ? "암호 숨기기" : "암호 표시";
+  };
+  visibility.addEventListener("click", () => {
+    const selectionStart = input.selectionStart;
+    const selectionEnd = input.selectionEnd;
+    updateVisibility(input.type === "password");
+    input.focus();
+    if (selectionStart !== null && selectionEnd !== null) input.setSelectionRange(selectionStart, selectionEnd);
+  });
+  updateVisibility(false);
+  field.append(leading, input, visibility);
+  return { field, input };
 }
 
 type BrandRule = { aliases: string[]; icon: SimpleIcon; logo?: string; custom?: "nhn-cloud" | "kt-cloud" | "axgate-vpn" };
@@ -282,21 +314,14 @@ function passwordPanel(initialized: boolean) {
     : "사용할 마스터 비밀번호를 설정하세요."));
 
   const form = el("form", "auth-form");
-  const pw = el("input") as HTMLInputElement;
-  pw.type = "password";
-  pw.autocomplete = initialized ? "current-password" : "new-password";
-  pw.placeholder = "마스터 비밀번호 (최소 12자)";
-  pw.required = true;
-  pw.minLength = 12;
-  form.append(pw);
+  const password = passwordField("마스터 비밀번호 (최소 12자)", initialized ? "current-password" : "new-password", 12);
+  const pw = password.input;
+  form.append(password.field);
   let confirm: HTMLInputElement | undefined;
   if (!initialized) {
-    confirm = el("input") as HTMLInputElement;
-    confirm.type = "password";
-    confirm.autocomplete = "new-password";
-    confirm.placeholder = "마스터 비밀번호 확인";
-    confirm.required = true;
-    form.append(confirm);
+    const confirmation = passwordField("마스터 비밀번호 확인", "new-password", 12);
+    confirm = confirmation.input;
+    form.append(confirmation.field);
   }
   const submit = el("button", "primary", initialized ? "잠금 해제" : "금고 생성") as HTMLButtonElement;
   submit.type = "submit";
@@ -774,16 +799,17 @@ function addDialog() {
 
 function backupDialog(mode: "export" | "import") {
   const form = el("form", "stack");
-  const pw = el("input") as HTMLInputElement;
-  pw.type = "password";
-  pw.placeholder = mode === "export" ? "백업 암호 (최소 12자)" : "백업 파일 암호";
-  pw.minLength = 12;
-  pw.required = true;
+  const password = passwordField(
+    mode === "export" ? "백업 암호 (최소 12자)" : "백업 파일 암호",
+    "off",
+    12,
+  );
+  const pw = password.input;
   const submit = el("button", "primary", mode === "export" ? "저장 위치 선택" : "백업 파일 선택") as HTMLButtonElement;
   submit.type = "submit";
   form.append(el("p", "muted", mode === "export"
     ? "새 salt와 nonce로 다시 암호화된 .enc 파일을 만듭니다."
-    : "가져온 항목은 현재 열린 금고를 대체합니다."), pw, submit);
+    : "가져온 항목은 현재 열린 금고를 대체합니다."), password.field, submit);
   const dialog = modal(mode === "export" ? "암호화 백업 내보내기" : "암호화 백업 복구", form);
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
