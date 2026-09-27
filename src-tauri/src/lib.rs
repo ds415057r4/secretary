@@ -39,6 +39,9 @@ const BACKUP_AAD: &[u8] = b"sentinel-totp:v1:backup";
 const KDF_MEMORY_KIB: u32 = 65_536;
 const KDF_ITERATIONS: u32 = 3;
 const KDF_PARALLELISM: u32 = 1;
+const MAX_KDF_MEMORY_KIB: u32 = 262_144;
+const MAX_KDF_ITERATIONS: u32 = 6;
+const MAX_KDF_PARALLELISM: u32 = 4;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CLIPBOARD_CLEAR_DELAY: Duration = Duration::from_secs(30);
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -473,11 +476,11 @@ fn validate_password(password: &str) -> CommandResult<()> {
 fn derive_key(password: &[u8], config: &KdfConfig) -> CommandResult<Zeroizing<[u8; 32]>> {
     if config.algorithm != "argon2id"
         || config.memory_kib < KDF_MEMORY_KIB
-        || config.memory_kib > 1_048_576
+        || config.memory_kib > MAX_KDF_MEMORY_KIB
         || config.iterations < KDF_ITERATIONS
-        || config.iterations > 10
+        || config.iterations > MAX_KDF_ITERATIONS
         || config.parallelism == 0
-        || config.parallelism > 8
+        || config.parallelism > MAX_KDF_PARALLELISM
     {
         return Err("지원하지 않거나 안전하지 않은 KDF 매개변수입니다.".into());
     }
@@ -1531,7 +1534,7 @@ fn update_entry(
         let decoded = B64
             .decode(encoded)
             .map_err(|_| "사용자 아이콘 데이터가 손상되었습니다.".to_string())?;
-        let decoded_image = image::load_from_memory(&decoded)
+        let decoded_image = decode_image_limited(&decoded, 128, 2 * 1024 * 1024)
             .map_err(|_| "사용자 아이콘을 읽을 수 없습니다.".to_string())?;
         if decoded_image.width() > 128 || decoded_image.height() > 128 {
             return Err("사용자 아이콘 크기가 올바르지 않습니다.".into());
@@ -1550,6 +1553,22 @@ fn update_entry(
         entry.icon = icon;
         save_local(&app, key, kdf, &vault)
     })
+}
+
+fn decode_image_limited(
+    bytes: &[u8],
+    max_dimension: u32,
+    max_alloc: u64,
+) -> Result<image::DynamicImage, image::ImageError> {
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(image::ImageError::IoError)?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max_dimension);
+    limits.max_image_height = Some(max_dimension);
+    limits.max_alloc = Some(max_alloc);
+    reader.limits(limits);
+    reader.decode()
 }
 
 #[tauri::command]
@@ -1571,8 +1590,8 @@ fn choose_entry_icon(app: AppHandle, window: WebviewWindow) -> CommandResult<Opt
         return Err("아이콘 이미지는 5MB 이하여야 합니다.".into());
     }
     let source = fs::read(&path).map_err(|e| error("아이콘 파일을 읽을 수 없습니다", e))?;
-    let image =
-        image::load_from_memory(&source).map_err(|e| error("지원하지 않거나 손상된 이미지", e))?;
+    let image = decode_image_limited(&source, 4096, 96 * 1024 * 1024)
+        .map_err(|e| error("지원하지 않거나 손상된 이미지", e))?;
     if image.width() > 4096 || image.height() > 4096 {
         return Err("아이콘 이미지 해상도는 4096×4096 이하여야 합니다.".into());
     }
@@ -2083,6 +2102,23 @@ mod tests {
         assert!(decrypt_vault(&envelope, &key, "vault").is_ok());
         envelope.ciphertext.push('A');
         assert!(decrypt_vault(&envelope, &key, "vault").is_err());
+    }
+
+    #[test]
+    fn rejects_excessive_kdf_cost() {
+        let mut kdf = new_kdf_config().unwrap();
+        kdf.memory_kib = MAX_KDF_MEMORY_KIB + 1;
+        assert!(derive_key(b"correct horse battery staple", &kdf).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_decoded_icon() {
+        let source = image::DynamicImage::new_rgba8(129, 1);
+        let mut png = Vec::new();
+        source
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(decode_image_limited(&png, 128, 2 * 1024 * 1024).is_err());
     }
 
     #[test]
