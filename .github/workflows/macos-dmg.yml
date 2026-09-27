@@ -36,12 +36,14 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build signed universal DMG
+      - name: Build universal DMG
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: "-"
-        run: npm run tauri -- build --target universal-apple-darwin --bundles dmg
+        run: >-
+          npm run tauri -- build
+          --target universal-apple-darwin
+          --bundles dmg
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Attach DMG to release
         uses: softprops/action-gh-release@v2
