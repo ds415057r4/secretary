@@ -31,6 +31,9 @@ use xcap::Monitor;
 use zeroize::{Zeroize, Zeroizing};
 
 const VAULT_FILE: &str = "vault.dat";
+const BIOMETRIC_MARKER_FILE: &str = "biometric.enabled";
+const BIOMETRIC_SERVICE: &str = "dev.sentinel.totp";
+const BIOMETRIC_ACCOUNT: &str = "vault-key";
 const AAD: &[u8] = b"sentinel-totp:v1:vault";
 const BACKUP_AAD: &[u8] = b"sentinel-totp:v1:backup";
 const KDF_MEMORY_KIB: u32 = 65_536;
@@ -128,6 +131,14 @@ enum TotpAlgorithm {
 struct VaultStatus {
     initialized: bool,
     unlocked: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BiometricStatus {
+    supported: bool,
+    enabled: bool,
+    method: String,
 }
 
 #[derive(Serialize)]
@@ -248,6 +259,188 @@ fn vault_path(app: &AppHandle) -> CommandResult<PathBuf> {
         .map_err(|e| error("앱 데이터 경로를 찾을 수 없습니다", e))?;
     fs::create_dir_all(&directory).map_err(|e| error("앱 데이터 폴더를 만들 수 없습니다", e))?;
     Ok(directory.join(VAULT_FILE))
+}
+
+fn biometric_marker_path(app: &AppHandle) -> CommandResult<PathBuf> {
+    let vault = vault_path(app)?;
+    Ok(vault.with_file_name(BIOMETRIC_MARKER_FILE))
+}
+
+#[cfg(windows)]
+mod platform_biometric {
+    use super::*;
+    use keyring::Entry;
+    use windows::{
+        core::{factory, HSTRING},
+        Security::Credentials::UI::{
+            UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
+        },
+        Win32::System::WinRT::IUserConsentVerifierInterop,
+    };
+    use windows_future::IAsyncOperation;
+
+    pub fn available() -> bool {
+        match UserConsentVerifier::CheckAvailabilityAsync() {
+            Ok(operation) => {
+                operation.join().ok() == Some(UserConsentVerifierAvailability::Available)
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn verify(window: &WebviewWindow, message: &str) -> CommandResult<()> {
+        let hwnd = window
+            .hwnd()
+            .map_err(|e| error("Windows 창 핸들 확인 실패", e))?;
+        let verifier: IUserConsentVerifierInterop =
+            factory::<UserConsentVerifier, IUserConsentVerifierInterop>()
+                .map_err(|e| error("Windows Hello 초기화 실패", e))?;
+        let operation: IAsyncOperation<UserConsentVerificationResult> =
+            unsafe { verifier.RequestVerificationForWindowAsync(hwnd, &HSTRING::from(message)) }
+                .map_err(|e| error("Windows Hello 요청 실패", e))?;
+        let result = operation
+            .join()
+            .map_err(|e| error("Windows Hello 인증 실패", e))?;
+        if result == UserConsentVerificationResult::Verified {
+            Ok(())
+        } else if result == UserConsentVerificationResult::Canceled {
+            Err("Windows Hello 인증을 취소했습니다.".into())
+        } else {
+            Err("Windows Hello 인증을 완료하지 못했습니다.".into())
+        }
+    }
+
+    fn entry() -> CommandResult<Entry> {
+        Entry::new(BIOMETRIC_SERVICE, BIOMETRIC_ACCOUNT)
+            .map_err(|e| error("Windows 자격 증명 저장소 열기 실패", e))
+    }
+
+    pub fn store(window: &WebviewWindow, key: &[u8; 32]) -> CommandResult<()> {
+        verify(window, "Secretary 생체 인증을 설정합니다.")?;
+        entry()?
+            .set_password(&B64.encode(key))
+            .map_err(|e| error("Windows 보호 저장소 쓰기 실패", e))
+    }
+
+    pub fn load(window: &WebviewWindow) -> CommandResult<Zeroizing<Vec<u8>>> {
+        verify(window, "Secretary 잠금을 해제합니다.")?;
+        let encoded = Zeroizing::new(
+            entry()?
+                .get_password()
+                .map_err(|e| error("Windows 보호 키 읽기 실패", e))?,
+        );
+        Ok(Zeroizing::new(B64.decode(encoded.as_bytes()).map_err(
+            |_| "저장된 Windows 보호 키가 손상되었습니다.".to_string(),
+        )?))
+    }
+
+    pub fn delete() -> CommandResult<()> {
+        match entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(error("Windows 보호 키 삭제 실패", e)),
+        }
+    }
+
+    pub const fn method() -> &'static str {
+        "Windows Hello"
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod platform_biometric {
+    use super::*;
+    use localauthentication::{LAContext, LAPolicy};
+    use security::{
+        AccessControl, AccessControlFlags, AccessControlProtection, Keychain, KeychainOptions,
+    };
+
+    pub fn available() -> bool {
+        LAContext::new()
+            .and_then(|context| {
+                context.can_evaluate_policy(LAPolicy::DeviceOwnerAuthenticationWithBiometrics)
+            })
+            .unwrap_or(false)
+    }
+
+    fn context() -> CommandResult<LAContext> {
+        let context = LAContext::new().map_err(|e| error("Touch ID 초기화 실패", e))?;
+        context
+            .set_localized_reason("Secretary 잠금을 해제합니다.")
+            .map_err(|e| error("Touch ID 안내 설정 실패", e))?;
+        context
+            .set_localized_fallback_title(None)
+            .map_err(|e| error("Touch ID 설정 실패", e))?;
+        Ok(context)
+    }
+
+    pub fn store(_window: &WebviewWindow, key: &[u8; 32]) -> CommandResult<()> {
+        let context = context()?;
+        if !context
+            .evaluate_policy(
+                LAPolicy::DeviceOwnerAuthenticationWithBiometrics,
+                "Secretary 생체 인증을 설정합니다.",
+            )
+            .map_err(|e| error("Touch ID 인증 실패", e))?
+        {
+            return Err("Touch ID 인증을 완료하지 못했습니다.".into());
+        }
+        let access = AccessControl::create(
+            AccessControlProtection::WhenUnlockedThisDeviceOnly,
+            AccessControlFlags::BIOMETRY_CURRENT_SET,
+        )
+        .map_err(|e| error("Touch ID 접근 제어 생성 실패", e))?;
+        let options = unsafe {
+            KeychainOptions::default()
+                .access_control(access)
+                .data_protection_keychain(true)
+                .authentication_context(context.as_raw_la_context())
+        }
+        .map_err(|e| error("Touch ID 인증 컨텍스트 연결 실패", e))?;
+        Keychain::set_with_options(BIOMETRIC_ACCOUNT, BIOMETRIC_SERVICE, key, &options)
+            .map_err(|e| error("Touch ID Keychain 저장 실패", e))
+    }
+
+    pub fn load(_window: &WebviewWindow) -> CommandResult<Zeroizing<Vec<u8>>> {
+        let context = context()?;
+        let options = unsafe {
+            KeychainOptions::default()
+                .data_protection_keychain(true)
+                .authentication_context(context.as_raw_la_context())
+        }
+        .map_err(|e| error("Touch ID 인증 컨텍스트 연결 실패", e))?;
+        let secret = Keychain::get_with_options(BIOMETRIC_ACCOUNT, BIOMETRIC_SERVICE, &options)
+            .map_err(|e| error("Touch ID Keychain 읽기 실패", e))?;
+        Ok(Zeroizing::new(secret.as_bytes().to_vec()))
+    }
+
+    pub fn delete() -> CommandResult<()> {
+        Keychain::delete(BIOMETRIC_ACCOUNT, BIOMETRIC_SERVICE)
+            .map_err(|e| error("Touch ID Keychain 삭제 실패", e))
+    }
+
+    pub const fn method() -> &'static str {
+        "Touch ID"
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod platform_biometric {
+    use super::*;
+    pub fn available() -> bool {
+        false
+    }
+    pub fn store(_window: &WebviewWindow, _key: &[u8; 32]) -> CommandResult<()> {
+        Err("이 운영체제에서는 생체 인증을 지원하지 않습니다.".into())
+    }
+    pub fn load(_window: &WebviewWindow) -> CommandResult<Zeroizing<Vec<u8>>> {
+        Err("이 운영체제에서는 생체 인증을 지원하지 않습니다.".into())
+    }
+    pub fn delete() -> CommandResult<()> {
+        Ok(())
+    }
+    pub const fn method() -> &'static str {
+        "생체 인증"
+    }
 }
 
 fn random_bytes<const N: usize>() -> CommandResult<[u8; N]> {
@@ -970,6 +1163,79 @@ fn vault_status(
 }
 
 #[tauri::command]
+fn biometric_status(app: AppHandle, window: WebviewWindow) -> CommandResult<BiometricStatus> {
+    require_window(&window, "main")?;
+    Ok(BiometricStatus {
+        supported: platform_biometric::available(),
+        enabled: biometric_marker_path(&app)?.exists(),
+        method: platform_biometric::method().into(),
+    })
+}
+
+#[tauri::command]
+fn enable_biometric(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> CommandResult<()> {
+    require_window(&window, "main")?;
+    if !platform_biometric::available() {
+        return Err(format!(
+            "{}을 사용할 수 없습니다.",
+            platform_biometric::method()
+        ));
+    }
+    let key = with_session(&state, |key| Ok(Zeroizing::new(*key)))?;
+    platform_biometric::store(&window, &key)?;
+    fs::write(biometric_marker_path(&app)?, b"1").map_err(|e| error("생체 인증 설정 저장 실패", e))
+}
+
+#[tauri::command]
+fn unlock_with_biometric(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> CommandResult<()> {
+    require_window(&window, "main")?;
+    if !biometric_marker_path(&app)?.exists() {
+        return Err("생체 인증이 설정되어 있지 않습니다.".into());
+    }
+    let stored = platform_biometric::load(&window)?;
+    let key_bytes: [u8; 32] = stored
+        .as_slice()
+        .try_into()
+        .map_err(|_| "OS 보호 저장소의 금고 키가 손상되었습니다.".to_string())?;
+    let key = Zeroizing::new(key_bytes);
+    let envelope = read_envelope(&vault_path(&app)?)?;
+    let _verified = decrypt_vault(&envelope, &key, "vault")?;
+    let mut guard = state
+        .session
+        .lock()
+        .map_err(|_| "보안 상태 잠금 오류".to_string())?;
+    *guard = Some(SessionKey {
+        key,
+        last_used: Instant::now(),
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn disable_biometric(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> CommandResult<()> {
+    require_window(&window, "main")?;
+    with_session(&state, |_| Ok(()))?;
+    platform_biometric::delete()?;
+    let marker = biometric_marker_path(&app)?;
+    if marker.exists() {
+        fs::remove_file(marker).map_err(|e| error("생체 인증 설정 삭제 실패", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn initialize_vault(
     app: AppHandle,
     window: WebviewWindow,
@@ -1338,7 +1604,11 @@ fn minimize_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<
 }
 
 #[tauri::command]
-fn set_mini_revealed(window: WebviewWindow, revealed: bool, item_count: Option<u32>) -> CommandResult<()> {
+fn set_mini_revealed(
+    window: WebviewWindow,
+    revealed: bool,
+    item_count: Option<u32>,
+) -> CommandResult<()> {
     require_window(&window, "mini")?;
     let monitor = window
         .current_monitor()
@@ -1347,7 +1617,14 @@ fn set_mini_revealed(window: WebviewWindow, revealed: bool, item_count: Option<u
     let work_area = monitor.work_area();
     let (width, height) = if revealed {
         let count = item_count.unwrap_or(0).min(6) as f64;
-        (320.0, if count == 0.0 { 104.0 } else { 18.0 + count * 62.0 })
+        (
+            320.0,
+            if count == 0.0 {
+                104.0
+            } else {
+                18.0 + count * 62.0
+            },
+        )
     } else {
         (6.0, 6.0)
     };
@@ -1457,9 +1734,13 @@ fn get_backup_status(
             .map_err(|e| error("백업 상태 확인 실패", e))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| path.file_name().and_then(|v| v.to_str()).is_some_and(|name| {
-                name.starts_with("secretary-auto-") && name.ends_with(".enc")
-            }))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|v| v.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("secretary-auto-") && name.ends_with(".enc")
+                    })
+            })
             .collect::<Vec<_>>();
         backups.sort();
         let Some(latest) = backups.last() else {
@@ -1722,6 +2003,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             vault_status,
+            biometric_status,
+            enable_biometric,
+            unlock_with_biometric,
+            disable_biometric,
             generate_password,
             copy_generated_password,
             initialize_vault,

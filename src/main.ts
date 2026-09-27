@@ -9,6 +9,7 @@ import {
   Dices,
   Download,
   FolderClock,
+  Fingerprint,
   ImagePlus,
   KeyRound,
   LockKeyhole,
@@ -92,6 +93,7 @@ type BackupSettingsView = {
 type BackupStatusView = {
   configured: boolean; healthy: boolean; fileCount: number; lastBackupAt?: number | null; message: string;
 };
+type BiometricStatus = { supported: boolean; enabled: boolean; method: string };
 
 const root = document.querySelector<HTMLDivElement>("#app")!;
 const axgateVpnLogo = new URL("./assets/brands/axgate-vpn.png", import.meta.url).href;
@@ -299,6 +301,25 @@ function passwordPanel(initialized: boolean) {
   const submit = el("button", "primary", initialized ? "잠금 해제" : "금고 생성") as HTMLButtonElement;
   submit.type = "submit";
   form.append(submit);
+  if (initialized) {
+    void invoke<BiometricStatus>("biometric_status").then((status) => {
+      if (!status.enabled) return;
+      const biometric = symbolButton(`${status.method}로 잠금 해제`, Fingerprint, async () => {
+        biometric.disabled = true;
+        try {
+          await invoke("unlock_with_biometric");
+          await showVault();
+        } catch (error) {
+          toast(String(error), "error");
+        } finally {
+          biometric.disabled = false;
+        }
+      }, "ghost biometric-unlock");
+      biometric.disabled = !status.supported;
+      if (!status.supported) biometric.title = `${status.method}을 현재 사용할 수 없습니다.`;
+      form.append(biometric);
+    }).catch(() => undefined);
+  }
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!initialized && pw.value !== confirm?.value) return toast("비밀번호가 일치하지 않습니다.", "error");
@@ -347,6 +368,10 @@ function showSettingsMenu(anchor: HTMLElement) {
       layer.remove();
       void backupCenterDialog();
     }, "popup-menu-action"),
+    symbolButton("생체 인증", Fingerprint, () => {
+      layer.remove();
+      void biometricSettingsDialog();
+    }, "popup-menu-action"),
     symbolButton("잠금", LockKeyhole, async () => {
       layer.remove();
       await invoke("lock_vault");
@@ -361,6 +386,46 @@ function showSettingsMenu(anchor: HTMLElement) {
   menu.style.top = `${anchorRect.bottom + 5}px`;
   layer.addEventListener("pointerdown", (event) => {
     if (event.target === layer) layer.remove();
+  });
+}
+
+async function biometricSettingsDialog() {
+  let status: BiometricStatus;
+  try {
+    status = await invoke<BiometricStatus>("biometric_status");
+  } catch (error) {
+    toast(String(error), "error");
+    return;
+  }
+  const body = el("section", "stack biometric-settings");
+  const symbol = el("div", `biometric-symbol${status.enabled ? " enabled" : ""}`);
+  symbol.append(icon(Fingerprint));
+  const state = status.enabled ? "사용 중" : status.supported ? "사용 가능" : "사용할 수 없음";
+  body.append(
+    symbol,
+    el("strong", "biometric-title", status.method),
+    el("p", "muted biometric-description", status.enabled
+      ? `다음 로그인부터 ${status.method}으로 금고를 잠금 해제할 수 있습니다.`
+      : status.supported
+        ? `마스터 비밀번호 대신 ${status.method}으로 빠르게 잠금을 해제합니다.`
+        : `${status.method}이 설정되어 있는지 운영체제 설정에서 확인하세요.`),
+    el("p", "biometric-state", state),
+  );
+  const action = el("button", status.enabled ? "ghost" : "primary", status.enabled ? "생체 인증 해제" : "생체 인증 설정") as HTMLButtonElement;
+  action.type = "button";
+  action.disabled = !status.supported && !status.enabled;
+  body.append(action);
+  const dialog = modal("생체 인증", body);
+  action.addEventListener("click", async () => {
+    action.disabled = true;
+    try {
+      await invoke(status.enabled ? "disable_biometric" : "enable_biometric");
+      dialog.remove();
+      toast(status.enabled ? "생체 인증을 해제했습니다." : `${status.method}을 설정했습니다.`);
+    } catch (error) {
+      toast(String(error), "error");
+      action.disabled = false;
+    }
   });
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "secretary"
-version = "0.1.1"
+version = "0.1.2"
 description = "Secretary encrypted authenticator"
 authors = ["you"]
 edition = "2021"
@@ -47,3 +47,12 @@ strip = true
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["windows-native"] }
+windows = { version = "0.62", features = ["Foundation", "Security_Credentials_UI", "Win32_Foundation", "Win32_System_WinRT"] }
+windows-future = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-localauthentication = "0.4"
+security-rs = "0.6"
