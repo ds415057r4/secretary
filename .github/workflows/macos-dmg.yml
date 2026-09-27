@@ -53,6 +53,14 @@ jobs:
           --bundles dmg
           --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
+      - name: Verify Swift runtime search paths
+        shell: bash
+        run: |
+          executable="src-tauri/target/universal-apple-darwin/release/bundle/macos/Secretary.app/Contents/MacOS/secretary"
+          test -x "$executable"
+          otool -l "$executable" | grep -A2 LC_RPATH | grep -q '/usr/lib/swift'
+          otool -l "$executable" | grep -A2 LC_RPATH | grep -q '@executable_path/../Frameworks'
+
       - name: Attach DMG to release
         uses: softprops/action-gh-release@v2
         with:
