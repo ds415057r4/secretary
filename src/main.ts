@@ -100,6 +100,7 @@ type CodeView = {
   issuer: string;
   account: string;
   code: string;
+  nextCode: string;
   period: number;
   remaining: number;
   icon?: string | null;
@@ -1094,6 +1095,13 @@ function codeCard(item: CodeView) {
     el("span", "otp-group", item.code.slice(0, splitAt)),
     el("span", "otp-group", item.code.slice(splitAt))
   );
+  const nextCode = el("div", "next-otp-code");
+  nextCode.append(
+    el("span", "next-otp-label", "다음"),
+    el("span", "next-otp-value", item.nextCode)
+  );
+  const codeStack = el("div", "otp-code-stack");
+  codeStack.append(code, nextCode);
   const expiring = item.remaining <= 5;
   if (expiring) code.classList.add("expiring");
   code.setAttribute("aria-label", `${item.issuer} OTP 복사`);
@@ -1118,7 +1126,7 @@ function codeCard(item: CodeView) {
   if (expiring) timer.classList.add("expiring");
   timer.setAttribute("role", "img");
   timer.setAttribute("aria-label", "OTP 만료 진행률");
-  right.append(code, timer);
+  right.append(codeStack, timer);
   card.append(left, right);
   card.tabIndex = 0;
   card.setAttribute("role", "button");
@@ -1247,6 +1255,8 @@ function updateCodeValues() {
       groups[0].textContent = item.code.slice(0, splitAt);
       groups[1].textContent = item.code.slice(splitAt);
     }
+    const nextCode = card.querySelector<HTMLElement>(".next-otp-value");
+    if (nextCode) nextCode.textContent = item.nextCode;
     const expiring = item.remaining <= 5;
     card.querySelector(".otp-code")?.classList.toggle("expiring", expiring);
     const timer = card.querySelector<SVGElement>(".timer-ring");

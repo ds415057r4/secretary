@@ -245,6 +245,7 @@ struct CodeView {
     issuer: String,
     account: String,
     code: String,
+    next_code: String,
     period: u64,
     remaining: u64,
     icon: Option<String>,
@@ -1547,6 +1548,27 @@ fn totp(entry: &OtpEntry, unix_seconds: u64) -> CommandResult<String> {
     ))
 }
 
+fn code_view(entry: &OtpEntry, unix_seconds: u64) -> CommandResult<CodeView> {
+    if entry.period == 0 {
+        return Err("저장된 TOTP period가 올바르지 않습니다.".into());
+    }
+    let next_timestamp = unix_seconds
+        .checked_add(entry.period)
+        .ok_or_else(|| "다음 TOTP 시각을 계산할 수 없습니다.".to_string())?;
+    Ok(CodeView {
+        id: entry.id,
+        issuer: entry.issuer.clone(),
+        account: entry.account.clone(),
+        code: totp(entry, unix_seconds)?,
+        next_code: totp(entry, next_timestamp)?,
+        period: entry.period,
+        remaining: entry.period - (unix_seconds % entry.period),
+        icon: entry.icon.clone(),
+        brand_icon: entry.brand_icon.clone(),
+        favorite: entry.favorite,
+    })
+}
+
 fn now_seconds() -> CommandResult<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1772,19 +1794,7 @@ fn list_codes(
         vault
             .entries
             .iter()
-            .map(|entry| {
-                Ok(CodeView {
-                    id: entry.id,
-                    issuer: entry.issuer.clone(),
-                    account: entry.account.clone(),
-                    code: totp(entry, now)?,
-                    period: entry.period,
-                    remaining: entry.period - (now % entry.period),
-                    icon: entry.icon.clone(),
-                    brand_icon: entry.brand_icon.clone(),
-                    favorite: entry.favorite,
-                })
-            })
+            .map(|entry| code_view(entry, now))
             .collect()
     })
 }
@@ -1803,19 +1813,7 @@ fn list_favorite_codes(
             .entries
             .iter()
             .filter(|entry| entry.favorite)
-            .map(|entry| {
-                Ok(CodeView {
-                    id: entry.id,
-                    issuer: entry.issuer.clone(),
-                    account: entry.account.clone(),
-                    code: totp(entry, now)?,
-                    period: entry.period,
-                    remaining: entry.period - (now % entry.period),
-                    icon: entry.icon.clone(),
-                    brand_icon: entry.brand_icon.clone(),
-                    favorite: true,
-                })
-            })
+            .map(|entry| code_view(entry, now))
             .collect()
     })
 }
@@ -2666,6 +2664,10 @@ mod tests {
             favorite: false,
         };
         assert_eq!(totp(&entry, 59).unwrap(), "94287082");
+        let view = code_view(&entry, 59).unwrap();
+        assert_eq!(view.code, "94287082");
+        assert_eq!(view.next_code, totp(&entry, 60).unwrap());
+        assert_eq!(view.remaining, 1);
     }
 
     #[test]
@@ -2835,9 +2837,13 @@ mod tests {
 
     #[test]
     fn parses_standard_uri() {
-        let parsed = parse_otpauth("otpauth://totp/Example:alice%40example.com?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=Example").unwrap();
+        let parsed = parse_otpauth("otpauth://totp/Example:alice%40example.com?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=Example&algorithm=SHA256&digits=8&period=45").unwrap();
         assert_eq!(parsed.issuer, "Example");
         assert_eq!(parsed.account, "alice@example.com");
+        assert_eq!(parsed.secret.as_str(), "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
+        assert!(matches!(parsed.algorithm, TotpAlgorithm::Sha256));
+        assert_eq!(parsed.digits, 8);
+        assert_eq!(parsed.period, 45);
     }
 
     #[test]
@@ -2877,6 +2883,13 @@ mod tests {
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].issuer, "Example");
         assert_eq!(parsed.entries[0].account, "alice@example.com");
+        assert_eq!(
+            parsed.entries[0].secret.as_str(),
+            BASE32_NOPAD.encode(b"12345678901234567890")
+        );
+        assert!(matches!(parsed.entries[0].algorithm, TotpAlgorithm::Sha1));
+        assert_eq!(parsed.entries[0].digits, 6);
+        assert_eq!(parsed.entries[0].period, 30);
         assert_eq!(parsed.batch_size, 2);
     }
 }

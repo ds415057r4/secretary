@@ -90,7 +90,7 @@ input:focus, textarea:focus { border-color: var(--hairline-strong); }
 .code-grid::-webkit-scrollbar-track { background: transparent; }
 .code-grid::-webkit-scrollbar-thumb { background: #343638; border-radius: 999px; }
 .code-grid::-webkit-scrollbar-thumb:active { background: #4b4d50; }
-.otp-card { min-height: 76px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: transparent; border: 0; border-radius: 8px; cursor: grab; user-select: none; touch-action: none; }
+.otp-card { min-height: 82px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: transparent; border: 0; border-radius: 8px; cursor: grab; user-select: none; touch-action: none; }
 .otp-card:active { cursor: grabbing; }
 .otp-card.dragging { opacity: .48; background: var(--card); }
 .otp-card img { -webkit-user-drag: none; }
@@ -120,6 +120,10 @@ input:focus, textarea:focus { border-color: var(--hairline-strong); }
 .icon-button { border: 0; background: transparent; color: var(--ash); }
 .otp-code { min-width: 0; padding: 4px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; color: white; background: transparent; border: 1px solid transparent; border-radius: 6px; font-size: 22px; font-weight: 560; font-variant-numeric: tabular-nums; letter-spacing: 0; text-align: center; }
 .otp-group { display: inline-block; }
+.otp-code-stack { min-width: 86px; display: grid; justify-items: center; gap: 0; }
+.next-otp-code { display: flex; align-items: center; gap: 5px; color: var(--ash); font-size: 10px; line-height: 1.3; white-space: nowrap; }
+.next-otp-label { color: var(--stone); }
+.next-otp-value { color: var(--mute); font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; letter-spacing: .06em; }
 .otp-code.expiring { animation: otp-expiring-pulse .8s ease-in-out infinite; }
 .timer-ring { width: 24px; height: 24px; flex: 0 0 24px; overflow: visible; transform: rotate(-90deg); }
 .timer-track, .timer-value { fill: none; stroke-width: 3; }
