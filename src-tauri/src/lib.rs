@@ -1163,35 +1163,43 @@ fn vault_status(
 }
 
 #[tauri::command]
-fn biometric_status(app: AppHandle, window: WebviewWindow) -> CommandResult<BiometricStatus> {
+async fn biometric_status(app: AppHandle, window: WebviewWindow) -> CommandResult<BiometricStatus> {
     require_window(&window, "main")?;
+    let supported = tauri::async_runtime::spawn_blocking(platform_biometric::available)
+        .await
+        .map_err(|e| error("생체 인증 지원 여부 확인 실패", e))?;
     Ok(BiometricStatus {
-        supported: platform_biometric::available(),
+        supported,
         enabled: biometric_marker_path(&app)?.exists(),
         method: platform_biometric::method().into(),
     })
 }
 
 #[tauri::command]
-fn enable_biometric(
+async fn enable_biometric(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> CommandResult<()> {
     require_window(&window, "main")?;
-    if !platform_biometric::available() {
+    let supported = tauri::async_runtime::spawn_blocking(platform_biometric::available)
+        .await
+        .map_err(|e| error("생체 인증 지원 여부 확인 실패", e))?;
+    if !supported {
         return Err(format!(
             "{}을 사용할 수 없습니다.",
             platform_biometric::method()
         ));
     }
     let key = with_session(&state, |key| Ok(Zeroizing::new(*key)))?;
-    platform_biometric::store(&window, &key)?;
+    tauri::async_runtime::spawn_blocking(move || platform_biometric::store(&window, &key))
+        .await
+        .map_err(|e| error("생체 인증 작업 실행 실패", e))??;
     fs::write(biometric_marker_path(&app)?, b"1").map_err(|e| error("생체 인증 설정 저장 실패", e))
 }
 
 #[tauri::command]
-fn unlock_with_biometric(
+async fn unlock_with_biometric(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, AppState>,
@@ -1200,7 +1208,9 @@ fn unlock_with_biometric(
     if !biometric_marker_path(&app)?.exists() {
         return Err("생체 인증이 설정되어 있지 않습니다.".into());
     }
-    let stored = platform_biometric::load(&window)?;
+    let stored = tauri::async_runtime::spawn_blocking(move || platform_biometric::load(&window))
+        .await
+        .map_err(|e| error("생체 인증 작업 실행 실패", e))??;
     let key_bytes: [u8; 32] = stored
         .as_slice()
         .try_into()
@@ -1622,7 +1632,7 @@ fn set_mini_revealed(
             if count == 0.0 {
                 104.0
             } else {
-                18.0 + count * 62.0
+                50.0 + count * 60.0
             },
         )
     } else {

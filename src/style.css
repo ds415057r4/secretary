@@ -103,7 +103,7 @@ input:focus, textarea:focus { border-color: var(--hairline-strong); }
 .issuer { margin-bottom: 2px; color: white; font-size: 14px; font-weight: 520; line-height: 1.4; }
 .issuer-row { min-width: 0; display: flex; align-items: center; gap: 5px; }
 .issuer-row .issuer { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.favorite-marker { width: 11px; height: 11px; flex: 0 0 11px; color: #ffc533; fill: currentColor; }
+.favorite-marker { width: 11px; height: 11px; flex: 0 0 11px; color: #ffc533; fill: currentColor; transform: translateY(-1px); }
 .account { max-width: 270px; margin: 0; overflow: hidden; color: var(--mute); font-size: 12px; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
 .icon-button { border: 0; background: transparent; color: var(--ash); }
 .otp-code { min-width: 0; padding: 6px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; color: white; background: transparent; border: 1px solid transparent; border-radius: 6px; font-size: 23px; font-weight: 560; font-variant-numeric: tabular-nums; letter-spacing: 0; text-align: center; }

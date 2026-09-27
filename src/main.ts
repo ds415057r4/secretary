@@ -1200,6 +1200,22 @@ function miniMode() {
   let transitionId = 0;
   let miniTimer: number | undefined;
   let favorites: CodeView[] = [];
+  let refreshingFavorites = false;
+
+  const favoritesStructure = (items: CodeView[]) => items
+    .map((item) => [item.id, item.issuer, item.account, item.icon ?? "", item.brandIcon ?? ""].join("\u0000"))
+    .join("\u0001");
+
+  const updateFavoriteValues = () => {
+    const rows = root.querySelectorAll<HTMLElement>(".mini-otp-row[data-entry-id]");
+    rows.forEach((row) => {
+      const item = favorites.find((candidate) => candidate.id === row.dataset.entryId);
+      const code = row.querySelector<HTMLElement>(".mini-code");
+      if (!item || !code) return;
+      code.classList.toggle("expiring", item.remaining <= 5);
+      if (code.dataset.copyFeedback !== "true") code.textContent = item.code;
+    });
+  };
 
   const renderFavorites = () => {
     const panel = el("section", "mini-panel");
@@ -1214,6 +1230,7 @@ function miniMode() {
       for (const item of favorites) {
         const row = el("button", "mini-otp-row") as HTMLButtonElement;
         row.type = "button";
+        row.dataset.entryId = item.id;
         const tile = el("span", "mini-entry-icon");
         const brand = matchedBrand(item);
         if (item.icon) {
@@ -1234,8 +1251,12 @@ function miniMode() {
         row.addEventListener("click", async () => {
           try {
             await invoke("copy_code", { id: item.id });
+            code.dataset.copyFeedback = "true";
             code.textContent = "복사됨";
-            window.setTimeout(() => { code.textContent = item.code; }, 700);
+            window.setTimeout(() => {
+              delete code.dataset.copyFeedback;
+              code.textContent = favorites.find((candidate) => candidate.id === item.id)?.code ?? item.code;
+            }, 700);
           } catch {
             await invoke("restore_main_window");
           }
@@ -1247,8 +1268,23 @@ function miniMode() {
   };
 
   const refreshFavorites = async () => {
-    favorites = await invoke<CodeView[]>("list_favorite_codes");
-    if (revealed) renderFavorites();
+    if (refreshingFavorites) return;
+    refreshingFavorites = true;
+    try {
+      const previousStructure = favoritesStructure(favorites);
+      const next = await invoke<CodeView[]>("list_favorite_codes");
+      const structureChanged = previousStructure !== favoritesStructure(next);
+      const countChanged = favorites.length !== next.length;
+      favorites = next;
+      if (!revealed) return;
+      if (countChanged) {
+        await invoke("set_mini_revealed", { revealed: true, itemCount: favorites.length });
+      }
+      if (structureChanged) renderFavorites();
+      else updateFavoriteValues();
+    } finally {
+      refreshingFavorites = false;
+    }
   };
 
   const reveal = async () => {
