@@ -56,13 +56,25 @@ jobs:
       - name: Repair and verify Swift runtime search paths
         shell: bash
         run: |
-          app="src-tauri/target/universal-apple-darwin/release/bundle/macos/Secretary.app"
-          executable="$app/Contents/MacOS/secretary"
           dmg_directory="src-tauri/target/universal-apple-darwin/release/bundle/dmg"
           dmg_path="$(find "$dmg_directory" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
-
-          test -x "$executable"
           test -n "$dmg_path"
+
+          mount_point="$(mktemp -d)"
+          staging="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+            rm -rf "$mount_point" "$staging"
+          }
+          trap cleanup EXIT
+
+          hdiutil attach "$dmg_path" -nobrowse -readonly -mountpoint "$mount_point"
+          cp -R "$mount_point/Secretary.app" "$staging/Secretary.app"
+          hdiutil detach "$mount_point"
+
+          app="$staging/Secretary.app"
+          executable="$app/Contents/MacOS/secretary"
+          test -x "$executable"
 
           rpaths="$(otool -l "$executable" | awk '/LC_RPATH/{getline; getline; print $2}')"
           if ! grep -Fxq '/usr/lib/swift' <<<"$rpaths"; then
@@ -80,9 +92,6 @@ jobs:
           grep -Fxq '/usr/lib/swift' <<<"$verified_rpaths"
           grep -Fxq '@executable_path/../Frameworks' <<<"$verified_rpaths"
 
-          staging="$(mktemp -d)"
-          trap 'rm -rf "$staging"' EXIT
-          cp -R "$app" "$staging/Secretary.app"
           ln -s /Applications "$staging/Applications"
           rm -f "$dmg_path"
           hdiutil create -volname Secretary -srcfolder "$staging" -ov -format UDZO "$dmg_path"
