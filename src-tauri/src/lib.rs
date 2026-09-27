@@ -1539,21 +1539,9 @@ async fn choose_entry_icon(app: AppHandle, window: WebviewWindow) -> CommandResu
 #[tauri::command]
 fn minimize_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<()> {
     require_window(&window, "main")?;
-    let mini = if let Some(existing) = app.get_webview_window("mini") {
-        existing
-    } else {
-        WebviewWindowBuilder::new(&app, "mini", WebviewUrl::App("index.html?mode=mini".into()))
-            .title("Secretary")
-            .decorations(false)
-            .transparent(true)
-            .background_color(tauri::utils::config::Color(0, 0, 0, 0))
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .resizable(false)
-            .visible(false)
-            .build()
-            .map_err(|e| error("미니 창 생성 실패", e))?
-    };
+    let mini = app
+        .get_webview_window("mini")
+        .ok_or_else(|| "미니 창을 찾을 수 없습니다.".to_string())?;
     let monitor = window
         .current_monitor()
         .map_err(|e| error("현재 모니터 확인 실패", e))?
@@ -1570,7 +1558,7 @@ fn minimize_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<
         .map_err(|e| error("미니 창 위치 설정 실패", e))?;
     mini.show().map_err(|e| error("미니 창 표시 실패", e))?;
     window.hide().map_err(|e| {
-        let _ = mini.close();
+        let _ = mini.hide();
         error("메인 창 숨기기 실패", e)
     })?;
     Ok(())
@@ -1624,7 +1612,7 @@ fn restore_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<(
         .map_err(|e| error("메인 창 포커스 실패", e))?;
     app.emit_to("main", "main-restored", ())
         .map_err(|e| error("메인 창 갱신 이벤트 실패", e))?;
-    window.close().map_err(|e| error("미니 창 닫기 실패", e))
+    window.hide().map_err(|e| error("미니 창 숨기기 실패", e))
 }
 
 #[tauri::command]
