@@ -1,0 +1,17 @@
+node_modules/
+dist/
+src-tauri/target/
+
+# Local secrets and encrypted user data
+.env
+.env.*
+!.env.example
+vault.dat
+*.enc
+
+# Editor and OS artifacts
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.pdb

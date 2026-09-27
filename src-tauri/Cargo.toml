@@ -1,0 +1,43 @@
+[package]
+name = "secretary"
+version = "0.1.0"
+description = "Secretary encrypted authenticator"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "secretary_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+data-encoding = "2.9"
+getrandom = "0.3"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "2.6"
+url = "2.5"
+uuid = { version = "1.18", features = ["v4", "serde"] }
+zeroize = { version = "1.8", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rqrr = "0.10"
+xcap = "0.9"
+percent-encoding = "2.3"
+prost = "0.14"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+strip = true
