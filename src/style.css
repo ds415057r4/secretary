@@ -45,6 +45,8 @@ textarea { min-height: 128px; resize: vertical; font-size: 13px; line-height: 1.
 input:focus, textarea:focus { border-color: var(--hairline-strong); }
 .password-field { position: relative; width: 100%; }
 .password-field input { padding-left: 39px; padding-right: 40px; }
+.password-field input::-ms-reveal,
+.password-field input::-ms-clear { display: none; }
 .password-field-icon { position: absolute; z-index: 1; left: 12px; top: 50%; width: 17px; height: 17px; display: grid; place-items: center; color: var(--ash); transform: translateY(-50%); pointer-events: none; }
 .password-field-icon .symbol, .password-visibility .symbol { width: 16px; height: 16px; }
 .password-field:focus-within .password-field-icon { color: var(--mute); }
