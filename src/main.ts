@@ -969,7 +969,7 @@ function codeCard(item: CodeView) {
     tile.dataset.accent = String(colorIndex);
     tile.append(icon(KeyRound, "entry-symbol"));
   }
-  const identity = el("div");
+  const identity = el("div", "entry-identity");
   const issuerRow = el("div", "issuer-row");
   issuerRow.append(el("h2", "issuer", item.issuer || "인증키"));
   if (item.favorite) issuerRow.append(icon(Star, "favorite-marker"));
@@ -1038,8 +1038,10 @@ function codeCard(item: CodeView) {
     requestAnimationFrame(() => card.classList.add("dragging"));
   });
   card.addEventListener("dragover", (event) => {
-    if (!draggedCard || draggedCard === card) return;
+    if (!draggedCard) return;
     event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    if (draggedCard === card) return;
     const bounds = card.getBoundingClientRect();
     const before = event.clientY < bounds.top + bounds.height / 2;
     card.parentElement?.insertBefore(draggedCard, before ? card : card.nextSibling);
@@ -1117,6 +1119,13 @@ async function showVault() {
   searchBar.append(search);
   const grid = el("section", "code-grid");
   grid.id = "code-grid";
+  grid.addEventListener("dragover", (event) => {
+    if (!draggedCard) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    if (event.target === grid) grid.append(draggedCard);
+  });
+  grid.addEventListener("drop", (event) => event.preventDefault());
   palette.append(searchBar, grid);
   page.append(header, palette);
   root.append(page);

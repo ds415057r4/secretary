@@ -80,14 +80,15 @@ input:focus, textarea:focus { border-color: var(--hairline-strong); }
 .code-grid::-webkit-scrollbar-track { background: transparent; }
 .code-grid::-webkit-scrollbar-thumb { background: #343638; border-radius: 999px; }
 .code-grid::-webkit-scrollbar-thumb:active { background: #4b4d50; }
-.otp-card { min-height: 76px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 10px 12px; background: transparent; border: 0; border-radius: 8px; cursor: grab; }
+.otp-card { min-height: 76px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: transparent; border: 0; border-radius: 8px; cursor: grab; }
 .otp-card:active { cursor: grabbing; }
 .otp-card.dragging { opacity: .48; background: var(--card); }
 .otp-card:hover, .otp-card:focus-within { background: var(--card); }
 .otp-card:active { background: #292b2e; }
 .entry-left, .entry-right { display: flex; align-items: center; }
 .entry-left { min-width: 0; gap: 12px; }
-.entry-right { flex-shrink: 0; gap: 12px; }
+.entry-right { flex-shrink: 0; gap: 8px; }
+.entry-identity { min-width: 0; flex: 1; }
 .entry-icon { position: relative; width: 44px; height: 44px; flex: 0 0 44px; padding: 10px; display: grid; place-items: center; color: #57c1ff; background: rgba(87,193,255,.15); border: 0; border-radius: 9px; overflow: visible; }
 .entry-icon[data-accent="1"] { color: #ff6161; background: rgba(255,97,97,.15); }
 .entry-icon[data-accent="2"] { color: #59d499; background: rgba(89,212,153,.15); }
@@ -104,9 +105,9 @@ input:focus, textarea:focus { border-color: var(--hairline-strong); }
 .issuer-row { min-width: 0; display: flex; align-items: center; gap: 5px; }
 .issuer-row .issuer { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .favorite-marker { width: 11px; height: 11px; flex: 0 0 11px; color: #ffc533; fill: currentColor; transform: translateY(-1px); }
-.account { max-width: 270px; margin: 0; overflow: hidden; color: var(--mute); font-size: 12px; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+.account { max-width: none; margin: 0; overflow: hidden; color: var(--mute); font-size: 12px; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
 .icon-button { border: 0; background: transparent; color: var(--ash); }
-.otp-code { min-width: 0; padding: 6px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; color: white; background: transparent; border: 1px solid transparent; border-radius: 6px; font-size: 23px; font-weight: 560; font-variant-numeric: tabular-nums; letter-spacing: 0; text-align: center; }
+.otp-code { min-width: 0; padding: 4px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; color: white; background: transparent; border: 1px solid transparent; border-radius: 6px; font-size: 22px; font-weight: 560; font-variant-numeric: tabular-nums; letter-spacing: 0; text-align: center; }
 .otp-group { display: inline-block; }
 .otp-code.expiring { animation: otp-expiring-pulse .8s ease-in-out infinite; }
 .timer-ring { width: 24px; height: 24px; flex: 0 0 24px; overflow: visible; transform: rotate(-90deg); }
