@@ -58,6 +58,7 @@ jobs:
         run: |
           executable="src-tauri/target/universal-apple-darwin/release/bundle/macos/Secretary.app/Contents/MacOS/secretary"
           test -x "$executable"
+          otool -l "$executable" | grep -A2 LC_RPATH
           otool -l "$executable" | grep -A2 LC_RPATH | grep -q '/usr/lib/swift'
           otool -l "$executable" | grep -A2 LC_RPATH | grep -q '@executable_path/../Frameworks'
 
