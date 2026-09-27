@@ -37,6 +37,7 @@ const KDF_MEMORY_KIB: u32 = 65_536;
 const KDF_ITERATIONS: u32 = 3;
 const KDF_PARALLELISM: u32 = 1;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CLIPBOARD_CLEAR_DELAY: Duration = Duration::from_secs(30);
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 type CommandResult<T> = Result<T, String>;
@@ -110,6 +111,8 @@ struct OtpEntry {
     icon: Option<String>,
     #[serde(default)]
     brand_icon: Option<String>,
+    #[serde(default)]
+    favorite: bool,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, Zeroize)]
@@ -137,6 +140,16 @@ struct BackupSettingsView {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct BackupStatusView {
+    configured: bool,
+    healthy: bool,
+    file_count: usize,
+    last_backup_at: Option<u64>,
+    message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CodeView {
     id: Uuid,
     issuer: String,
@@ -146,6 +159,7 @@ struct CodeView {
     remaining: u64,
     icon: Option<String>,
     brand_icon: Option<String>,
+    favorite: bool,
 }
 
 #[derive(Serialize)]
@@ -440,10 +454,18 @@ fn with_session<T>(
         *guard = None;
     }
     let session = guard
-        .as_mut()
+        .as_ref()
         .ok_or_else(|| "금고가 잠겼습니다.".to_string())?;
-    session.last_used = Instant::now();
     action(&session.key)
+}
+
+fn schedule_clipboard_clear(app: AppHandle, copied: Zeroizing<String>) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(CLIPBOARD_CLEAR_DELAY).await;
+        if app.clipboard().read_text().ok().as_deref() == Some(copied.as_str()) {
+            let _ = app.clipboard().write_text(String::new());
+        }
+    });
 }
 
 fn load_local(app: &AppHandle, key: &[u8; 32]) -> CommandResult<(Vault, KdfConfig)> {
@@ -730,6 +752,7 @@ fn add_parsed(
             period: parsed.period,
             icon: None,
             brand_icon: None,
+            favorite: false,
         });
         save_local(app, key, kdf, &vault)?;
         Ok(view)
@@ -774,6 +797,7 @@ fn add_many(
                 period: item.period,
                 icon: None,
                 brand_icon: None,
+                favorite: false,
             });
             added += 1;
         }
@@ -913,7 +937,9 @@ fn copy_generated_password(
     }
     app.clipboard()
         .write_text(password.to_string())
-        .map_err(|e| error("클립보드 쓰기 실패", e))
+        .map_err(|e| error("클립보드 쓰기 실패", e))?;
+    schedule_clipboard_clear(app, password);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1006,6 +1032,24 @@ fn lock_vault(window: WebviewWindow, state: State<'_, AppState>) -> CommandResul
 }
 
 #[tauri::command]
+fn touch_session(window: WebviewWindow, state: State<'_, AppState>) -> CommandResult<()> {
+    require_window(&window, "main")?;
+    let mut guard = state
+        .session
+        .lock()
+        .map_err(|_| "보안 상태 잠금 오류".to_string())?;
+    let session = guard
+        .as_mut()
+        .ok_or_else(|| "금고가 잠겼습니다.".to_string())?;
+    if session.last_used.elapsed() >= SESSION_TIMEOUT {
+        *guard = None;
+        return Err("금고가 잠겼습니다.".into());
+    }
+    session.last_used = Instant::now();
+    Ok(())
+}
+
+#[tauri::command]
 fn list_codes(
     app: AppHandle,
     window: WebviewWindow,
@@ -1028,6 +1072,38 @@ fn list_codes(
                     remaining: entry.period - (now % entry.period),
                     icon: entry.icon.clone(),
                     brand_icon: entry.brand_icon.clone(),
+                    favorite: entry.favorite,
+                })
+            })
+            .collect()
+    })
+}
+
+#[tauri::command]
+fn list_favorite_codes(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> CommandResult<Vec<CodeView>> {
+    require_window(&window, "mini")?;
+    with_session(&state, |key| {
+        let (vault, _) = load_local(&app, key)?;
+        let now = now_seconds()?;
+        vault
+            .entries
+            .iter()
+            .filter(|entry| entry.favorite)
+            .map(|entry| {
+                Ok(CodeView {
+                    id: entry.id,
+                    issuer: entry.issuer.clone(),
+                    account: entry.account.clone(),
+                    code: totp(entry, now)?,
+                    period: entry.period,
+                    remaining: entry.period - (now % entry.period),
+                    icon: entry.icon.clone(),
+                    brand_icon: entry.brand_icon.clone(),
+                    favorite: true,
                 })
             })
             .collect()
@@ -1062,6 +1138,27 @@ fn delete_entry(
         if vault.entries.len() == before {
             return Err("삭제할 항목을 찾지 못했습니다.".into());
         }
+        save_local(&app, key, kdf, &vault)
+    })
+}
+
+#[tauri::command]
+fn set_entry_favorite(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    id: Uuid,
+    favorite: bool,
+) -> CommandResult<()> {
+    require_window(&window, "main")?;
+    with_session(&state, |key| {
+        let (mut vault, kdf) = load_local(&app, key)?;
+        let entry = vault
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| "수정할 항목을 찾지 못했습니다.".to_string())?;
+        entry.favorite = favorite;
         save_local(&app, key, kdf, &vault)
     })
 }
@@ -1241,16 +1338,21 @@ fn minimize_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<
 }
 
 #[tauri::command]
-fn set_mini_revealed(window: WebviewWindow, revealed: bool) -> CommandResult<()> {
+fn set_mini_revealed(window: WebviewWindow, revealed: bool, item_count: Option<u32>) -> CommandResult<()> {
     require_window(&window, "mini")?;
     let monitor = window
         .current_monitor()
         .map_err(|e| error("현재 모니터 확인 실패", e))?
         .ok_or_else(|| "현재 모니터를 찾을 수 없습니다.".to_string())?;
     let work_area = monitor.work_area();
-    let extent = if revealed { 40.0 } else { 6.0 };
+    let (width, height) = if revealed {
+        let count = item_count.unwrap_or(0).min(6) as f64;
+        (320.0, if count == 0.0 { 104.0 } else { 18.0 + count * 62.0 })
+    } else {
+        (6.0, 6.0)
+    };
     window
-        .set_size(tauri::LogicalSize::new(extent, extent))
+        .set_size(tauri::LogicalSize::new(width, height))
         .map_err(|e| error("미니 창 크기 설정 실패", e))?;
     let size = window
         .outer_size()
@@ -1286,7 +1388,9 @@ fn copy_code(
     state: State<'_, AppState>,
     id: Uuid,
 ) -> CommandResult<()> {
-    require_window(&window, "main")?;
+    if window.label() != "main" && window.label() != "mini" {
+        return Err("허용되지 않은 창에서 호출했습니다.".into());
+    }
     let code = with_session(&state, |key| {
         let (vault, _) = load_local(&app, key)?;
         let entry = vault
@@ -1296,9 +1400,12 @@ fn copy_code(
             .ok_or_else(|| "항목을 찾지 못했습니다.".to_string())?;
         totp(entry, now_seconds()?)
     })?;
+    let code = Zeroizing::new(code);
     app.clipboard()
-        .write_text(code)
-        .map_err(|e| error("클립보드 쓰기 실패", e))
+        .write_text(code.to_string())
+        .map_err(|e| error("클립보드 쓰기 실패", e))?;
+    schedule_clipboard_clear(app, code);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1314,6 +1421,70 @@ fn get_backup_settings(
             automatic_file: vault.backup.automatic_file,
             directory: vault.backup.directory.clone(),
             retention: vault.backup.retention,
+        })
+    })
+}
+
+#[tauri::command]
+fn get_backup_status(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> CommandResult<BackupStatusView> {
+    require_window(&window, "main")?;
+    with_session(&state, |key| {
+        let (vault, _) = load_local(&app, key)?;
+        if !vault.backup.automatic_file {
+            return Ok(BackupStatusView {
+                configured: false,
+                healthy: false,
+                file_count: 0,
+                last_backup_at: None,
+                message: "자동 백업이 꺼져 있습니다.".into(),
+            });
+        }
+        let directory = PathBuf::from(&vault.backup.directory);
+        if !directory.is_dir() {
+            return Ok(BackupStatusView {
+                configured: true,
+                healthy: false,
+                file_count: 0,
+                last_backup_at: None,
+                message: "백업 폴더를 찾을 수 없습니다.".into(),
+            });
+        }
+        let mut backups = fs::read_dir(&directory)
+            .map_err(|e| error("백업 상태 확인 실패", e))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.file_name().and_then(|v| v.to_str()).is_some_and(|name| {
+                name.starts_with("secretary-auto-") && name.ends_with(".enc")
+            }))
+            .collect::<Vec<_>>();
+        backups.sort();
+        let Some(latest) = backups.last() else {
+            return Ok(BackupStatusView {
+                configured: true,
+                healthy: false,
+                file_count: 0,
+                last_backup_at: None,
+                message: "아직 생성된 자동 백업이 없습니다.".into(),
+            });
+        };
+        let envelope = read_envelope(latest)?;
+        decrypt_vault(&envelope, key, "backup")?;
+        let last_backup_at = latest
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs());
+        Ok(BackupStatusView {
+            configured: true,
+            healthy: true,
+            file_count: backups.len(),
+            last_backup_at,
+            message: "최근 백업의 무결성을 확인했습니다.".into(),
         })
     })
 }
@@ -1534,6 +1705,16 @@ fn scan_screen_region(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+            if let Some(mini) = app.get_webview_window("mini") {
+                let _ = mini.hide();
+            }
+        }))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::default())
@@ -1546,9 +1727,12 @@ pub fn run() {
             initialize_vault,
             unlock_vault,
             lock_vault,
+            touch_session,
             list_codes,
+            list_favorite_codes,
             add_otpauth_uri,
             delete_entry,
+            set_entry_favorite,
             reorder_entries,
             update_entry,
             choose_entry_icon,
@@ -1558,6 +1742,7 @@ pub fn run() {
             close_main_window,
             copy_code,
             get_backup_settings,
+            get_backup_status,
             choose_backup_directory,
             save_backup_settings,
             export_backup,
@@ -1586,6 +1771,7 @@ mod tests {
             period: 30,
             icon: None,
             brand_icon: None,
+            favorite: false,
         };
         assert_eq!(totp(&entry, 59).unwrap(), "94287082");
     }

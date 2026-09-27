@@ -20,6 +20,7 @@ import {
   Search,
   SearchX,
   Settings,
+  Star,
   Trash2,
   Upload,
   X,
@@ -82,10 +83,14 @@ type CodeView = {
   remaining: number;
   icon?: string | null;
   brandIcon?: string | null;
+  favorite: boolean;
 };
 type ImportSummary = { added: number; skipped: number; weakSecrets: number; batchIndex: number; batchSize: number };
 type BackupSettingsView = {
   automaticFile: boolean; directory: string; retention: number;
+};
+type BackupStatusView = {
+  configured: boolean; healthy: boolean; fileCount: number; lastBackupAt?: number | null; message: string;
 };
 
 const root = document.querySelector<HTMLDivElement>("#app")!;
@@ -98,6 +103,8 @@ let draggedCard: HTMLElement | null = null;
 let suppressCopyUntil = 0;
 let checkingUpdate = false;
 let updatePromptShown = false;
+let vaultVisible = false;
+let lastActivitySync = 0;
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string) {
   const node = document.createElement(tag);
@@ -261,6 +268,7 @@ function toast(message: string, kind: "ok" | "error" = "ok") {
 }
 
 function passwordPanel(initialized: boolean) {
+  vaultVisible = false;
   root.replaceChildren();
   const titlebar = createTitlebar(false);
   titlebar.classList.add("auth-titlebar");
@@ -438,13 +446,27 @@ async function checkForUpdates(manual = false) {
 
 async function backupCenterDialog() {
   let settings: BackupSettingsView;
+  let backupStatus: BackupStatusView | null = null;
   try {
-    settings = await invoke<BackupSettingsView>("get_backup_settings");
+    [settings, backupStatus] = await Promise.all([
+      invoke<BackupSettingsView>("get_backup_settings"),
+      invoke<BackupStatusView>("get_backup_status"),
+    ]);
   } catch (error) {
     toast(String(error), "error");
     return;
   }
   const form = el("form", "stack backup-settings-form");
+  const status = el("section", `backup-status ${backupStatus.healthy ? "healthy" : "warning"}`);
+  const statusTitle = backupStatus.healthy ? "백업 정상" : backupStatus.configured ? "백업 점검 필요" : "자동 백업 꺼짐";
+  const lastBackup = backupStatus.lastBackupAt
+    ? new Date(backupStatus.lastBackupAt * 1000).toLocaleString()
+    : "없음";
+  status.append(
+    el("strong", "backup-status-title", statusTitle),
+    el("p", "muted", backupStatus.message),
+    el("p", "backup-status-meta", `파일 ${backupStatus.fileCount}개 · 최근 백업 ${lastBackup}`),
+  );
   const enabledLabel = el("label", "toggle-row");
   const enabled = el("input") as HTMLInputElement;
   enabled.type = "checkbox";
@@ -482,6 +504,7 @@ async function backupCenterDialog() {
   }, "ghost");
   manualActions.append(exportButton, importButton);
   form.append(
+    status,
     el("p", "muted", "자동 백업도 AES-256-GCM으로 암호화되며 현재 마스터 비밀번호로 복구할 수 있습니다."),
     enabledLabel,
     el("p", "field-label", "백업 폴더"), directoryRow,
@@ -829,12 +852,24 @@ function showEntryContextMenu(item: CodeView, x: number, y: number) {
     editEntryDialog(item);
   }, "context-menu-action");
   edit.setAttribute("role", "menuitem");
+  const favorite = symbolButton(item.favorite ? "즐겨찾기 해제" : "즐겨찾기", Star, async () => {
+    layer.remove();
+    try {
+      await invoke("set_entry_favorite", { id: item.id, favorite: !item.favorite });
+      await refreshCodes();
+      toast(item.favorite ? "즐겨찾기에서 해제했습니다." : "즐겨찾기에 추가했습니다.");
+    } catch (error) {
+      toast(String(error), "error");
+    }
+  }, "context-menu-action");
+  favorite.setAttribute("role", "menuitem");
+  if (item.favorite) favorite.classList.add("favorite-active");
   const remove = symbolButton("삭제", Trash2, () => {
     layer.remove();
     void deleteEntry(item);
   }, "context-menu-action danger");
   remove.setAttribute("role", "menuitem");
-  menu.append(edit, remove);
+  menu.append(favorite, edit, remove);
   layer.append(menu);
   document.body.append(layer);
   const rect = menu.getBoundingClientRect();
@@ -849,6 +884,7 @@ function codeCard(item: CodeView) {
   const card = el("article", "otp-card");
   card.dataset.entryId = item.id;
   card.draggable = true;
+  card.title = "드래그해 순서 변경 · 클릭해 OTP 복사";
   const left = el("div", "entry-left");
   const tile = el("div", "entry-icon");
   const colorIndex = [...item.id].reduce((total, char) => total + char.charCodeAt(0), 0) % 4;
@@ -869,7 +905,10 @@ function codeCard(item: CodeView) {
     tile.append(icon(KeyRound, "entry-symbol"));
   }
   const identity = el("div");
-    identity.append(el("h2", "issuer", item.issuer || "인증키"), el("p", "account", item.account));
+  const issuerRow = el("div", "issuer-row");
+  issuerRow.append(el("h2", "issuer", item.issuer || "인증키"));
+  if (item.favorite) issuerRow.append(icon(Star, "favorite-marker"));
+  identity.append(issuerRow, el("p", "account", item.account));
   left.append(tile, identity);
   const right = el("div", "entry-right");
   const copyCode = async () => {
@@ -993,6 +1032,8 @@ async function refreshCodes() {
 }
 
 async function showVault() {
+  vaultVisible = true;
+  lastActivitySync = Date.now();
   root.replaceChildren();
   const page = el("main", "app-shell");
   const header = createTitlebar(true);
@@ -1092,54 +1133,109 @@ function miniMode() {
   button.setAttribute("aria-label", "Secretary 창 열기");
   let revealed = false;
   let transitionId = 0;
+  let miniTimer: number | undefined;
+  let favorites: CodeView[] = [];
+
+  const renderFavorites = () => {
+    const panel = el("section", "mini-panel");
+    const head = el("button", "mini-head") as HTMLButtonElement;
+    head.type = "button";
+    head.append(el("strong", "", "즐겨찾기"), el("span", "", "Secretary 열기"));
+    head.addEventListener("click", () => void invoke("restore_main_window"));
+    panel.append(head);
+    if (!favorites.length) {
+      panel.append(el("p", "mini-empty", "즐겨찾기한 OTP가 없습니다."));
+    } else {
+      for (const item of favorites) {
+        const row = el("button", "mini-otp-row") as HTMLButtonElement;
+        row.type = "button";
+        const tile = el("span", "mini-entry-icon");
+        const brand = matchedBrand(item);
+        if (item.icon) {
+          const image = el("img", "custom-entry-icon") as HTMLImageElement;
+          image.src = item.icon;
+          image.alt = "";
+          tile.append(image);
+        } else if (brand) {
+          tile.style.color = hasDarkBrandColor(brand.icon.hex) ? "#f4f4f6" : `#${brand.icon.hex}`;
+          tile.append(renderBrandSymbol(brand));
+        } else {
+          tile.append(icon(KeyRound, "entry-symbol"));
+        }
+        const identity = el("span", "mini-identity");
+        identity.append(el("strong", "", item.issuer || "인증키"), el("small", "", item.account));
+        const code = el("span", `mini-code${item.remaining <= 5 ? " expiring" : ""}`, item.code);
+        row.append(tile, identity, code);
+        row.addEventListener("click", async () => {
+          try {
+            await invoke("copy_code", { id: item.id });
+            code.textContent = "복사됨";
+            window.setTimeout(() => { code.textContent = item.code; }, 700);
+          } catch {
+            await invoke("restore_main_window");
+          }
+        });
+        panel.append(row);
+      }
+    }
+    root.replaceChildren(panel);
+  };
+
+  const refreshFavorites = async () => {
+    favorites = await invoke<CodeView[]>("list_favorite_codes");
+    if (revealed) renderFavorites();
+  };
+
   const reveal = async () => {
     if (revealed) return;
     const id = ++transitionId;
     try {
-      await invoke("set_mini_revealed", { revealed: true });
+      favorites = await invoke<CodeView[]>("list_favorite_codes");
+      await invoke("set_mini_revealed", { revealed: true, itemCount: favorites.length });
       if (id !== transitionId) return;
       requestAnimationFrame(() => {
         if (id !== transitionId) return;
         revealed = true;
-        button.classList.add("revealed");
+        renderFavorites();
+        miniTimer = window.setInterval(() => void refreshFavorites(), 1000);
       });
     } catch (error) {
-      toast(String(error), "error");
+      await invoke("restore_main_window");
     }
   };
   const conceal = async () => {
     if (!revealed) return;
     const id = ++transitionId;
     revealed = false;
-    button.classList.remove("revealed");
-    await new Promise((resolve) => window.setTimeout(resolve, 220));
+    if (miniTimer) window.clearInterval(miniTimer);
+    root.classList.add("mini-concealing");
+    await new Promise((resolve) => window.setTimeout(resolve, 180));
     if (id !== transitionId) return;
     try {
       await invoke("set_mini_revealed", { revealed: false });
+      root.classList.remove("mini-concealing");
+      root.replaceChildren(button);
     } catch (error) {
       toast(String(error), "error");
     }
   };
-  button.addEventListener("pointerenter", () => void reveal());
-  button.addEventListener("pointerleave", () => void conceal());
-  let restoring = false;
-  button.addEventListener("click", async () => {
-    if (restoring) return;
-    restoring = true;
-    try {
-      await invoke("restore_main_window");
-    } catch (error) {
-      toast(String(error), "error");
-    } finally {
-      restoring = false;
-    }
-  });
+  root.addEventListener("pointerenter", () => void reveal());
+  root.addEventListener("pointerleave", () => void conceal());
   root.append(button);
 }
 
 async function bootstrap() {
   if (getCurrentWindow().label === "scanner") return scannerMode();
   if (getCurrentWindow().label === "mini") return miniMode();
+  const registerActivity = () => {
+    if (!vaultVisible || Date.now() - lastActivitySync < 10_000) return;
+    lastActivitySync = Date.now();
+    void invoke("touch_session").catch(() => {
+      if (vaultVisible) passwordPanel(true);
+    });
+  };
+  window.addEventListener("pointerdown", registerActivity, { capture: true, passive: true });
+  window.addEventListener("keydown", registerActivity, { capture: true });
   await listen<ImportSummary>("vault-changed", async (event) => {
     await refreshCodes();
     const skipped = event.payload.skipped ? ` · 중복 ${event.payload.skipped}개 제외` : "";
