@@ -53,14 +53,39 @@ jobs:
           --bundles dmg
           --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-      - name: Verify Swift runtime search paths
+      - name: Repair and verify Swift runtime search paths
         shell: bash
         run: |
-          executable="src-tauri/target/universal-apple-darwin/release/bundle/macos/Secretary.app/Contents/MacOS/secretary"
+          app="src-tauri/target/universal-apple-darwin/release/bundle/macos/Secretary.app"
+          executable="$app/Contents/MacOS/secretary"
+          dmg_directory="src-tauri/target/universal-apple-darwin/release/bundle/dmg"
+          dmg_path="$(find "$dmg_directory" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+
           test -x "$executable"
-          otool -l "$executable" | grep -A2 LC_RPATH
-          otool -l "$executable" | grep -A2 LC_RPATH | grep -q '/usr/lib/swift'
-          otool -l "$executable" | grep -A2 LC_RPATH | grep -q '@executable_path/../Frameworks'
+          test -n "$dmg_path"
+
+          rpaths="$(otool -l "$executable" | awk '/LC_RPATH/{getline; getline; print $2}')"
+          if ! grep -Fxq '/usr/lib/swift' <<<"$rpaths"; then
+            install_name_tool -add_rpath /usr/lib/swift "$executable"
+          fi
+          if ! grep -Fxq '@executable_path/../Frameworks' <<<"$rpaths"; then
+            install_name_tool -add_rpath '@executable_path/../Frameworks' "$executable"
+          fi
+
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+
+          verified_rpaths="$(otool -l "$executable" | awk '/LC_RPATH/{getline; getline; print $2}')"
+          printf '%s\n' "$verified_rpaths"
+          grep -Fxq '/usr/lib/swift' <<<"$verified_rpaths"
+          grep -Fxq '@executable_path/../Frameworks' <<<"$verified_rpaths"
+
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          cp -R "$app" "$staging/Secretary.app"
+          ln -s /Applications "$staging/Applications"
+          rm -f "$dmg_path"
+          hdiutil create -volname Secretary -srcfolder "$staging" -ov -format UDZO "$dmg_path"
 
       - name: Attach DMG to release
         uses: softprops/action-gh-release@v2
