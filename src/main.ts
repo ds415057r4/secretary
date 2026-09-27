@@ -123,7 +123,6 @@ let refreshTimer: number | undefined;
 let refreshingCodes = false;
 let searchQuery = "";
 let dragInProgress = false;
-let draggedCard: HTMLElement | null = null;
 let suppressCopyUntil = 0;
 let checkingUpdate = false;
 let updatePromptShown = false;
@@ -1061,13 +1060,13 @@ function codeCard(item: CodeView) {
   let pointerDragging = false;
   const finishPointerDrag = async (event: PointerEvent, persist: boolean) => {
     if (pointerId !== event.pointerId) return;
-    if (card.hasPointerCapture(pointerId)) card.releasePointerCapture(pointerId);
+    const completedPointerId = pointerId;
     pointerId = null;
+    if (card.hasPointerCapture(completedPointerId)) card.releasePointerCapture(completedPointerId);
     if (!pointerDragging) return;
     pointerDragging = false;
     card.classList.remove("dragging");
     dragInProgress = false;
-    draggedCard = null;
     suppressCopyUntil = Date.now() + 350;
     if (!persist) {
       await refreshCodes();
@@ -1096,7 +1095,6 @@ function codeCard(item: CodeView) {
       if (Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y) < 6) return;
       pointerDragging = true;
       dragInProgress = true;
-      draggedCard = card;
       card.classList.add("dragging");
     }
     event.preventDefault();
@@ -1105,15 +1103,14 @@ function codeCard(item: CodeView) {
     const listBounds = list.getBoundingClientRect();
     if (event.clientY < listBounds.top + 32) list.scrollTop -= 10;
     else if (event.clientY > listBounds.bottom - 32) list.scrollTop += 10;
-    const hit = document.elementFromPoint(event.clientX, event.clientY);
-    const target = hit?.closest<HTMLElement>(".otp-card");
-    if (target && target !== card && target.parentElement === list) {
-      const bounds = target.getBoundingClientRect();
-      list.insertBefore(card, event.clientY < bounds.top + bounds.height / 2 ? target : target.nextSibling);
-      return;
-    }
-    const last = list.querySelector<HTMLElement>(".otp-card:last-child");
-    if (last && last !== card && event.clientY > last.getBoundingClientRect().top) list.append(card);
+    const target = Array.from(list.querySelectorAll<HTMLElement>(".otp-card"))
+      .filter((candidate) => candidate !== card)
+      .find((candidate) => {
+        const bounds = candidate.getBoundingClientRect();
+        return event.clientY < bounds.top + bounds.height / 2;
+      });
+    if (target) list.insertBefore(card, target);
+    else list.append(card);
   });
   card.addEventListener("pointerup", (event) => void finishPointerDrag(event, true));
   card.addEventListener("pointercancel", (event) => void finishPointerDrag(event, false));
