@@ -4,7 +4,7 @@ import { defineConfig } from "vite";
 
 const usedLogos = [
   "google-icon", "youtube-icon", "github-icon", "gitlab-icon", "discord-icon",
-  "notion-icon", "figma", "dropbox", "apple", "facebook", "cloudflare-icon",
+  "notion-icon", "figma", "dropbox", "apple", "facebook", "instagram-icon", "cloudflare-icon",
   "atlassian", "auth0-icon", "okta-icon", "paypal", "steam", "twitch",
   "reddit-icon", "spotify-icon", "netflix-icon", "telegram", "whatsapp-icon",
   "tiktok-icon", "wordpress-icon", "shopify", "docker-icon", "zoom-icon",
