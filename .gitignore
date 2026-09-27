@@ -8,6 +8,7 @@ src-tauri/target/
 !.env.example
 vault.dat
 *.enc
+*.pfx
 
 # Editor and OS artifacts
 .idea/
