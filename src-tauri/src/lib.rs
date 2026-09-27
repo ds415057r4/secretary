@@ -1572,13 +1572,18 @@ fn decode_image_limited(
 }
 
 #[tauri::command]
-fn choose_entry_icon(app: AppHandle, window: WebviewWindow) -> CommandResult<Option<String>> {
+async fn choose_entry_icon(app: AppHandle, window: WebviewWindow) -> CommandResult<Option<String>> {
     require_window(&window, "main")?;
-    let selected = app
-        .dialog()
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
         .file()
         .add_filter("Raster image", &["png", "jpg", "jpeg", "webp"])
-        .blocking_pick_file();
+        .pick_file(move |selected| {
+            let _ = sender.send(selected);
+        });
+    let selected = receiver
+        .await
+        .map_err(|_| "아이콘 선택 창의 응답을 받지 못했습니다.".to_string())?;
     let Some(path) = selected else {
         return Ok(None);
     };
@@ -1800,9 +1805,18 @@ fn get_backup_status(
 }
 
 #[tauri::command]
-fn choose_backup_directory(app: AppHandle, window: WebviewWindow) -> CommandResult<Option<String>> {
+async fn choose_backup_directory(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> CommandResult<Option<String>> {
     require_window(&window, "main")?;
-    let selected = app.dialog().file().blocking_pick_folder();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |selected| {
+        let _ = sender.send(selected);
+    });
+    let selected = receiver
+        .await
+        .map_err(|_| "백업 폴더 선택 창의 응답을 받지 못했습니다.".to_string())?;
     let Some(path) = selected else {
         return Ok(None);
     };
@@ -1839,7 +1853,7 @@ fn save_backup_settings(
 }
 
 #[tauri::command]
-fn export_backup(
+async fn export_backup(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, AppState>,
@@ -1854,12 +1868,17 @@ fn export_backup(
         let backup_key = derive_key(password.as_bytes(), &kdf)?;
         encrypt_vault(&vault, &backup_key, kdf, "backup")
     })?;
-    let selected = app
-        .dialog()
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
         .file()
         .add_filter("Secretary encrypted backup", &["enc"])
         .set_file_name("secretary-backup.enc")
-        .blocking_save_file();
+        .save_file(move |selected| {
+            let _ = sender.send(selected);
+        });
+    let selected = receiver
+        .await
+        .map_err(|_| "백업 저장 창의 응답을 받지 못했습니다.".to_string())?;
     let Some(path) = selected else {
         return Ok(false);
     };
@@ -1871,7 +1890,7 @@ fn export_backup(
 }
 
 #[tauri::command]
-fn import_backup(
+async fn import_backup(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, AppState>,
@@ -1879,11 +1898,16 @@ fn import_backup(
 ) -> CommandResult<bool> {
     require_window(&window, "main")?;
     let password = Zeroizing::new(password);
-    let selected = app
-        .dialog()
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
         .file()
         .add_filter("Secretary encrypted backup", &["enc"])
-        .blocking_pick_file();
+        .pick_file(move |selected| {
+            let _ = sender.send(selected);
+        });
+    let selected = receiver
+        .await
+        .map_err(|_| "백업 파일 선택 창의 응답을 받지 못했습니다.".to_string())?;
     let Some(path) = selected else {
         return Ok(false);
     };
