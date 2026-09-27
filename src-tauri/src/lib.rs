@@ -1628,9 +1628,10 @@ fn restore_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<(
 }
 
 #[tauri::command]
-fn close_main_window(window: WebviewWindow) -> CommandResult<()> {
+fn close_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<()> {
     require_window(&window, "main")?;
-    window.close().map_err(|e| error("앱 창 닫기 실패", e))
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
