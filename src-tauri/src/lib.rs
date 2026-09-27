@@ -507,8 +507,8 @@ fn normalize_secret(input: &str) -> CommandResult<Zeroizing<String>> {
             .decode(normalized.as_bytes())
             .map_err(|_| "Secret은 올바른 Base32여야 합니다.".to_string())?,
     );
-    if decoded.len() < 16 {
-        return Err("Secret은 최소 128비트여야 합니다.".into());
+    if decoded.is_empty() {
+        return Err("Secret이 비어 있습니다.".into());
     }
     Ok(normalized)
 }
@@ -639,11 +639,8 @@ fn parse_google_migration(input: &str) -> CommandResult<ParsedQr> {
                     .into(),
             );
         }
-        if parameter.secret.len() < 10 {
-            return Err(
-                "Google 내보내기에 80비트 미만의 비정상적으로 짧은 Secret이 포함되어 있습니다."
-                    .into(),
-            );
+        if parameter.secret.is_empty() {
+            return Err("Google 내보내기에 비어 있는 Secret이 포함되어 있습니다.".into());
         }
         if parameter.secret.len() < 16 {
             weak_secrets += 1;
@@ -1612,6 +1609,18 @@ mod tests {
         let parsed = parse_otpauth("otpauth://totp/Example:alice%40example.com?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=Example").unwrap();
         assert_eq!(parsed.issuer, "Example");
         assert_eq!(parsed.account, "alice@example.com");
+    }
+
+    #[test]
+    fn accepts_legacy_80_bit_secret() {
+        let parsed =
+            parse_otpauth("otpauth://totp/GitHub:octocat?secret=JBSWY3DPEHPK3PXP&issuer=GitHub")
+                .unwrap();
+        assert_eq!(parsed.issuer, "GitHub");
+        assert_eq!(
+            BASE32_NOPAD.decode(parsed.secret.as_bytes()).unwrap().len(),
+            10
+        );
     }
 
     #[test]
