@@ -99,6 +99,7 @@ type BiometricStatus = { supported: boolean; enabled: boolean; method: string };
 
 const root = document.querySelector<HTMLDivElement>("#app")!;
 const axgateVpnLogo = new URL("./assets/brands/axgate-vpn.png", import.meta.url).href;
+const hunesionLogo = new URL("./assets/brands/hunesion.png", import.meta.url).href;
 let codes: CodeView[] = [];
 let refreshTimer: number | undefined;
 let searchQuery = "";
@@ -153,11 +154,12 @@ function passwordField(placeholder: string, autocomplete: AutoFill, minLength?: 
   return { field, input };
 }
 
-type BrandRule = { aliases: string[]; icon: SimpleIcon; logo?: string; custom?: "nhn-cloud" | "kt-cloud" | "axgate-vpn" };
+type BrandRule = { aliases: string[]; icon: SimpleIcon; logo?: string; custom?: "nhn-cloud" | "kt-cloud" | "axgate-vpn" | "hunesion" };
 const brandInfo = (slug: string, title: string, hex: string) => ({
   slug, title, hex, path: "", source: "",
 }) as SimpleIcon;
 const brandRules: BrandRule[] = [
+  { aliases: ["i-onengs", "i-one ngs", "ionengs", "hunesion", "휴네시온"], icon: brandInfo("hunesion", "i-oneNGS", "0868B2"), custom: "hunesion" },
   { aliases: ["axgate vpn", "axgate", "엑스게이트"], icon: brandInfo("axgate-vpn", "AXGATE VPN", "F15A24"), custom: "axgate-vpn" },
   { aliases: ["nhn cloud", "nhn클라우드", "nhn 클라우드"], icon: brandInfo("nhn-cloud", "NHN Cloud", "3E64FF"), custom: "nhn-cloud" },
   { aliases: ["kt cloud", "kt클라우드", "kt 클라우드"], icon: brandInfo("kt-cloud", "KT Cloud", "E60012"), custom: "kt-cloud" },
@@ -245,10 +247,10 @@ function fullColorBrandSymbol(name: string) {
   return svg;
 }
 
-function customCloudSymbol(name: "nhn-cloud" | "kt-cloud" | "axgate-vpn") {
-  if (name === "axgate-vpn") {
+function customCloudSymbol(name: "nhn-cloud" | "kt-cloud" | "axgate-vpn" | "hunesion") {
+  if (name === "axgate-vpn" || name === "hunesion") {
     const image = el("img", "brand-service-image") as HTMLImageElement;
-    image.src = axgateVpnLogo;
+    image.src = name === "hunesion" ? hunesionLogo : axgateVpnLogo;
     image.alt = "";
     image.draggable = false;
     return image;
@@ -974,7 +976,7 @@ function showEntryContextMenu(item: CodeView, x: number, y: number) {
 function codeCard(item: CodeView) {
   const card = el("article", "otp-card");
   card.dataset.entryId = item.id;
-  card.draggable = true;
+  card.draggable = false;
   card.title = "드래그해 순서 변경 · 클릭해 OTP 복사";
   const left = el("div", "entry-left");
   const tile = el("div", "entry-icon");
@@ -1056,28 +1058,23 @@ function codeCard(item: CodeView) {
     event.preventDefault();
     showEntryContextMenu(item, event.clientX, event.clientY);
   });
-  card.addEventListener("dragstart", (event) => {
-    dragInProgress = true;
-    draggedCard = card;
-    event.dataTransfer?.setData("text/plain", item.id);
-    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
-    requestAnimationFrame(() => card.classList.add("dragging"));
-  });
-  card.addEventListener("dragover", (event) => {
-    if (!draggedCard) return;
-    event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-    if (draggedCard === card) return;
-    const bounds = card.getBoundingClientRect();
-    const before = event.clientY < bounds.top + bounds.height / 2;
-    card.parentElement?.insertBefore(draggedCard, before ? card : card.nextSibling);
-  });
-  card.addEventListener("drop", (event) => event.preventDefault());
-  card.addEventListener("dragend", async () => {
+  let pointerId: number | null = null;
+  let pointerStart = { x: 0, y: 0 };
+  let pointerDragging = false;
+  const finishPointerDrag = async (event: PointerEvent, persist: boolean) => {
+    if (pointerId !== event.pointerId) return;
+    if (card.hasPointerCapture(pointerId)) card.releasePointerCapture(pointerId);
+    pointerId = null;
+    if (!pointerDragging) return;
+    pointerDragging = false;
     card.classList.remove("dragging");
     dragInProgress = false;
     draggedCard = null;
-    suppressCopyUntil = Date.now() + 300;
+    suppressCopyUntil = Date.now() + 350;
+    if (!persist) {
+      await refreshCodes();
+      return;
+    }
     const orderedIds = Array.from(document.querySelectorAll<HTMLElement>("#code-grid .otp-card"))
       .map((node) => node.dataset.entryId)
       .filter((id): id is string => Boolean(id));
@@ -1088,7 +1085,44 @@ function codeCard(item: CodeView) {
       toast(String(error), "error");
       await refreshCodes();
     }
+  };
+  card.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || pointerId !== null) return;
+    pointerId = event.pointerId;
+    pointerStart = { x: event.clientX, y: event.clientY };
+    card.setPointerCapture(event.pointerId);
   });
+  card.addEventListener("pointermove", (event) => {
+    if (pointerId !== event.pointerId) return;
+    if (!pointerDragging) {
+      if (Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y) < 6) return;
+      pointerDragging = true;
+      dragInProgress = true;
+      draggedCard = card;
+      card.classList.add("dragging");
+    }
+    event.preventDefault();
+    const list = card.parentElement;
+    if (!list) return;
+    const listBounds = list.getBoundingClientRect();
+    if (event.clientY < listBounds.top + 32) list.scrollTop -= 10;
+    else if (event.clientY > listBounds.bottom - 32) list.scrollTop += 10;
+    const hit = document.elementFromPoint(event.clientX, event.clientY);
+    const target = hit?.closest<HTMLElement>(".otp-card");
+    if (target && target !== card && target.parentElement === list) {
+      const bounds = target.getBoundingClientRect();
+      list.insertBefore(card, event.clientY < bounds.top + bounds.height / 2 ? target : target.nextSibling);
+      return;
+    }
+    const last = list.querySelector<HTMLElement>(".otp-card:last-child");
+    if (last && last !== card && event.clientY > last.getBoundingClientRect().top) list.append(card);
+  });
+  card.addEventListener("pointerup", (event) => void finishPointerDrag(event, true));
+  card.addEventListener("pointercancel", (event) => void finishPointerDrag(event, false));
+  card.addEventListener("lostpointercapture", (event) => {
+    if (pointerId === event.pointerId) void finishPointerDrag(event, true);
+  });
+  card.addEventListener("dragstart", (event) => event.preventDefault());
   return card;
 }
 
@@ -1145,13 +1179,6 @@ async function showVault() {
   searchBar.append(search);
   const grid = el("section", "code-grid");
   grid.id = "code-grid";
-  grid.addEventListener("dragover", (event) => {
-    if (!draggedCard) return;
-    event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-    if (event.target === grid) grid.append(draggedCard);
-  });
-  grid.addEventListener("drop", (event) => event.preventDefault());
   palette.append(searchBar, grid);
   page.append(header, palette);
   root.append(page);
@@ -1361,6 +1388,7 @@ function miniMode() {
 }
 
 async function bootstrap() {
+  window.addEventListener("contextmenu", (event) => event.preventDefault());
   if (getCurrentWindow().label === "scanner") return scannerMode();
   if (getCurrentWindow().label === "mini") return miniMode();
   const registerActivity = () => {

@@ -88,9 +88,10 @@ input:focus, textarea:focus { border-color: var(--hairline-strong); }
 .code-grid::-webkit-scrollbar-track { background: transparent; }
 .code-grid::-webkit-scrollbar-thumb { background: #343638; border-radius: 999px; }
 .code-grid::-webkit-scrollbar-thumb:active { background: #4b4d50; }
-.otp-card { min-height: 76px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: transparent; border: 0; border-radius: 8px; cursor: grab; }
+.otp-card { min-height: 76px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: transparent; border: 0; border-radius: 8px; cursor: grab; user-select: none; touch-action: none; }
 .otp-card:active { cursor: grabbing; }
 .otp-card.dragging { opacity: .48; background: var(--card); }
+.otp-card img { -webkit-user-drag: none; }
 .otp-card:hover, .otp-card:focus-within { background: var(--card); }
 .otp-card:active { background: #292b2e; }
 .entry-left, .entry-right { display: flex; align-items: center; }
