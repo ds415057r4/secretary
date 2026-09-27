@@ -35,9 +35,13 @@ rqrr = "0.10"
 xcap = "0.9"
 percent-encoding = "2.3"
 prost = "0.14"
+tauri-plugin-process = "2"
 
 [profile.release]
 panic = "abort"
 codegen-units = 1
 lto = true
 strip = true
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"

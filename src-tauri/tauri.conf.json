@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Secretary",
   "version": "0.1.0",
-    "identifier": "dev.sentinel.totp",
+  "identifier": "dev.sentinel.totp",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -50,11 +50,26 @@
     ],
     "security": {
       "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self'; font-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'",
-      "capabilities": ["main-capability"]
+      "capabilities": [
+        "main-capability"
+      ]
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "requireSignedVersion": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY5OUY2NDE1MEI2NkI5RkMKUldUOHVXWUxGV1NmYVFiUWJqbkhYa1ozM3JSQituZndBU1hSU29qU0RlZEJVNWJqWE5jSnlIdksK",
+      "endpoints": [
+        "https://github.com/enbraining/secretary/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

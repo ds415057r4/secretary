@@ -274,7 +274,10 @@ fn derive_key(password: &[u8], config: &KdfConfig) -> CommandResult<Zeroizing<[u
     {
         return Err("지원하지 않거나 안전하지 않은 KDF 매개변수입니다.".into());
     }
-    let salt = Zeroizing::new(B64.decode(&config.salt).map_err(|_| "KDF salt가 손상되었습니다.".to_string())?);
+    let salt = Zeroizing::new(
+        B64.decode(&config.salt)
+            .map_err(|_| "KDF salt가 손상되었습니다.".to_string())?,
+    );
     if salt.len() != 16 {
         return Err("KDF salt 길이가 올바르지 않습니다.".into());
     }
@@ -293,13 +296,26 @@ fn derive_key(password: &[u8], config: &KdfConfig) -> CommandResult<Zeroizing<[u
     Ok(key)
 }
 
-fn encrypt_vault(vault: &Vault, key: &[u8; 32], kdf: KdfConfig, kind: &str) -> CommandResult<EncryptedEnvelope> {
+fn encrypt_vault(
+    vault: &Vault,
+    key: &[u8; 32],
+    kdf: KdfConfig,
+    kind: &str,
+) -> CommandResult<EncryptedEnvelope> {
     let aad = if kind == "backup" { BACKUP_AAD } else { AAD };
-    let plaintext = Zeroizing::new(serde_json::to_vec(vault).map_err(|e| error("금고 직렬화 실패", e))?);
+    let plaintext =
+        Zeroizing::new(serde_json::to_vec(vault).map_err(|e| error("금고 직렬화 실패", e))?);
     let nonce_bytes = random_bytes::<12>()?;
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "암호화 키가 올바르지 않습니다.".to_string())?;
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|_| "암호화 키가 올바르지 않습니다.".to_string())?;
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), Payload { msg: &plaintext, aad })
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &plaintext,
+                aad,
+            },
+        )
         .map_err(|_| "금고 암호화 실패".to_string())?;
     Ok(EncryptedEnvelope {
         version: 1,
@@ -310,11 +326,17 @@ fn encrypt_vault(vault: &Vault, key: &[u8; 32], kdf: KdfConfig, kind: &str) -> C
     })
 }
 
-fn decrypt_vault(envelope: &EncryptedEnvelope, key: &[u8; 32], expected_kind: &str) -> CommandResult<Vault> {
+fn decrypt_vault(
+    envelope: &EncryptedEnvelope,
+    key: &[u8; 32],
+    expected_kind: &str,
+) -> CommandResult<Vault> {
     if envelope.version != 1 || envelope.kind != expected_kind {
         return Err("지원하지 않는 금고 형식입니다.".into());
     }
-    let nonce = B64.decode(&envelope.nonce).map_err(|_| "nonce가 손상되었습니다.".to_string())?;
+    let nonce = B64
+        .decode(&envelope.nonce)
+        .map_err(|_| "nonce가 손상되었습니다.".to_string())?;
     if nonce.len() != 12 {
         return Err("nonce 길이가 올바르지 않습니다.".into());
     }
@@ -322,11 +344,22 @@ fn decrypt_vault(envelope: &EncryptedEnvelope, key: &[u8; 32], expected_kind: &s
         B64.decode(&envelope.ciphertext)
             .map_err(|_| "암호문이 손상되었습니다.".to_string())?,
     );
-    let aad = if expected_kind == "backup" { BACKUP_AAD } else { AAD };
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "복호화 키가 올바르지 않습니다.".to_string())?;
+    let aad = if expected_kind == "backup" {
+        BACKUP_AAD
+    } else {
+        AAD
+    };
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|_| "복호화 키가 올바르지 않습니다.".to_string())?;
     let plaintext = Zeroizing::new(
         cipher
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: &ciphertext, aad })
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &ciphertext,
+                    aad,
+                },
+            )
             .map_err(|_| "암호가 틀렸거나 파일이 변조되었습니다.".to_string())?,
     );
     serde_json::from_slice(&plaintext).map_err(|e| error("복호화 데이터 형식 오류", e))
@@ -343,22 +376,26 @@ fn read_envelope(path: &Path) -> CommandResult<EncryptedEnvelope> {
 
 fn atomic_write(path: &Path, envelope: &EncryptedEnvelope) -> CommandResult<()> {
     let bytes = serde_json::to_vec(envelope).map_err(|e| error("암호화 파일 직렬화 실패", e))?;
-    let parent = path.parent().ok_or_else(|| "저장 폴더가 올바르지 않습니다.".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "저장 폴더가 올바르지 않습니다.".to_string())?;
     fs::create_dir_all(parent).map_err(|e| error("저장 폴더 생성 실패", e))?;
     let temp = parent.join(format!(".secretary-{}.tmp", Uuid::new_v4()));
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&temp)
             .map_err(|e| error("임시 파일 생성 실패", e))?;
-        file.write_all(&bytes).map_err(|e| error("임시 파일 쓰기 실패", e))?;
-        file.sync_all().map_err(|e| error("임시 파일 동기화 실패", e))?;
+        file.write_all(&bytes)
+            .map_err(|e| error("임시 파일 쓰기 실패", e))?;
+        file.sync_all()
+            .map_err(|e| error("임시 파일 동기화 실패", e))?;
     }
     #[cfg(not(unix))]
     {
@@ -368,8 +405,10 @@ fn atomic_write(path: &Path, envelope: &EncryptedEnvelope) -> CommandResult<()> 
             .create_new(true)
             .open(&temp)
             .map_err(|e| error("임시 파일 생성 실패", e))?;
-        file.write_all(&bytes).map_err(|e| error("임시 파일 쓰기 실패", e))?;
-        file.sync_all().map_err(|e| error("임시 파일 동기화 실패", e))?;
+        file.write_all(&bytes)
+            .map_err(|e| error("임시 파일 쓰기 실패", e))?;
+        file.sync_all()
+            .map_err(|e| error("임시 파일 동기화 실패", e))?;
     }
 
     if path.exists() {
@@ -385,8 +424,14 @@ fn atomic_write(path: &Path, envelope: &EncryptedEnvelope) -> CommandResult<()> 
     Ok(())
 }
 
-fn with_session<T>(state: &State<'_, AppState>, action: impl FnOnce(&[u8; 32]) -> CommandResult<T>) -> CommandResult<T> {
-    let mut guard = state.session.lock().map_err(|_| "보안 상태 잠금 오류".to_string())?;
+fn with_session<T>(
+    state: &State<'_, AppState>,
+    action: impl FnOnce(&[u8; 32]) -> CommandResult<T>,
+) -> CommandResult<T> {
+    let mut guard = state
+        .session
+        .lock()
+        .map_err(|_| "보안 상태 잠금 오류".to_string())?;
     let expired = guard
         .as_ref()
         .map(|session| session.last_used.elapsed() >= SESSION_TIMEOUT)
@@ -394,7 +439,9 @@ fn with_session<T>(state: &State<'_, AppState>, action: impl FnOnce(&[u8; 32]) -
     if expired {
         *guard = None;
     }
-    let session = guard.as_mut().ok_or_else(|| "금고가 잠겼습니다.".to_string())?;
+    let session = guard
+        .as_mut()
+        .ok_or_else(|| "금고가 잠겼습니다.".to_string())?;
     session.last_used = Instant::now();
     action(&session.key)
 }
@@ -438,7 +485,9 @@ fn write_automatic_file_backup(vault: &Vault, key: &[u8; 32], kdf: KdfConfig) ->
         })
         .collect::<Vec<_>>();
     backups.sort();
-    let excess = backups.len().saturating_sub(vault.backup.retention as usize);
+    let excess = backups
+        .len()
+        .saturating_sub(vault.backup.retention as usize);
     for old in backups.into_iter().take(excess) {
         fs::remove_file(&old).map_err(|e| error("오래된 자동 백업 삭제 실패", e))?;
     }
@@ -495,13 +544,17 @@ fn parse_otpauth(input: &str) -> CommandResult<ParsedOtp> {
                 }
             }
             "digits" => {
-                digits = value.parse().map_err(|_| "digits 값이 올바르지 않습니다.".to_string())?;
+                digits = value
+                    .parse()
+                    .map_err(|_| "digits 값이 올바르지 않습니다.".to_string())?;
                 if digits != 6 && digits != 8 {
                     return Err("6자리 또는 8자리 TOTP만 지원합니다.".into());
                 }
             }
             "period" => {
-                period = value.parse().map_err(|_| "period 값이 올바르지 않습니다.".to_string())?;
+                period = value
+                    .parse()
+                    .map_err(|_| "period 값이 올바르지 않습니다.".to_string())?;
                 if !(15..=120).contains(&period) {
                     return Err("TOTP period는 15~120초여야 합니다.".into());
                 }
@@ -544,7 +597,8 @@ fn parse_google_migration(input: &str) -> CommandResult<ParsedQr> {
     if input.len() > 65_536 {
         return Err("Google Authenticator 내보내기 데이터가 너무 큽니다.".into());
     }
-    let url = Url::parse(input).map_err(|_| "올바른 Google Authenticator 내보내기 QR이 아닙니다.".to_string())?;
+    let url = Url::parse(input)
+        .map_err(|_| "올바른 Google Authenticator 내보내기 QR이 아닙니다.".to_string())?;
     if url.scheme() != "otpauth-migration" || url.host_str() != Some("offline") {
         return Err("지원하지 않는 Google Authenticator 마이그레이션 URI입니다.".into());
     }
@@ -580,10 +634,16 @@ fn parse_google_migration(input: &str) -> CommandResult<ParsedQr> {
     let mut weak_secrets = 0_usize;
     for parameter in payload.otp_parameters.drain(..) {
         if parameter.otp_type != 2 {
-            return Err("Google 내보내기의 HOTP 계정은 지원하지 않습니다. TOTP 계정만 가져올 수 있습니다.".into());
+            return Err(
+                "Google 내보내기의 HOTP 계정은 지원하지 않습니다. TOTP 계정만 가져올 수 있습니다."
+                    .into(),
+            );
         }
         if parameter.secret.len() < 10 {
-            return Err("Google 내보내기에 80비트 미만의 비정상적으로 짧은 Secret이 포함되어 있습니다.".into());
+            return Err(
+                "Google 내보내기에 80비트 미만의 비정상적으로 짧은 Secret이 포함되어 있습니다."
+                    .into(),
+            );
         }
         if parameter.secret.len() < 16 {
             weak_secrets += 1;
@@ -621,7 +681,12 @@ fn parse_google_migration(input: &str) -> CommandResult<ParsedQr> {
             period: 30,
         });
     }
-    Ok(ParsedQr { entries: parsed, weak_secrets, batch_index, batch_size })
+    Ok(ParsedQr {
+        entries: parsed,
+        weak_secrets,
+        batch_index,
+        batch_size,
+    })
 }
 
 fn percent_decode(value: &str) -> CommandResult<String> {
@@ -631,7 +696,11 @@ fn percent_decode(value: &str) -> CommandResult<String> {
     Ok(decoded.into_owned())
 }
 
-fn add_parsed(app: &AppHandle, state: &State<'_, AppState>, parsed: ParsedOtp) -> CommandResult<EntryView> {
+fn add_parsed(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    parsed: ParsedOtp,
+) -> CommandResult<EntryView> {
     with_session(state, |key| {
         let (mut vault, kdf) = load_local(app, key)?;
         let candidate = BASE32_NOPAD
@@ -649,7 +718,11 @@ fn add_parsed(app: &AppHandle, state: &State<'_, AppState>, parsed: ParsedOtp) -
             return Err("이미 등록된 Secret입니다.".into());
         }
         let id = Uuid::new_v4();
-        let view = EntryView { id, issuer: parsed.issuer.clone(), account: parsed.account.clone() };
+        let view = EntryView {
+            id,
+            issuer: parsed.issuer.clone(),
+            account: parsed.account.clone(),
+        };
         vault.entries.push(OtpEntry {
             id,
             issuer: parsed.issuer,
@@ -666,7 +739,11 @@ fn add_parsed(app: &AppHandle, state: &State<'_, AppState>, parsed: ParsedOtp) -
     })
 }
 
-fn add_many(app: &AppHandle, state: &State<'_, AppState>, parsed: ParsedQr) -> CommandResult<ImportSummary> {
+fn add_many(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    parsed: ParsedQr,
+) -> CommandResult<ImportSummary> {
     with_session(state, |key| {
         let (mut vault, kdf) = load_local(app, key)?;
         let mut added = 0_usize;
@@ -727,17 +804,20 @@ fn totp(entry: &OtpEntry, unix_seconds: u64) -> CommandResult<String> {
     let message = counter.to_be_bytes();
     let digest = match entry.algorithm {
         TotpAlgorithm::Sha1 => {
-            let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(&secret).map_err(|_| "HMAC 키 오류".to_string())?;
+            let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(&secret)
+                .map_err(|_| "HMAC 키 오류".to_string())?;
             mac.update(&message);
             Zeroizing::new(mac.finalize().into_bytes().to_vec())
         }
         TotpAlgorithm::Sha256 => {
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&secret).map_err(|_| "HMAC 키 오류".to_string())?;
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&secret)
+                .map_err(|_| "HMAC 키 오류".to_string())?;
             mac.update(&message);
             Zeroizing::new(mac.finalize().into_bytes().to_vec())
         }
         TotpAlgorithm::Sha512 => {
-            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&secret).map_err(|_| "HMAC 키 오류".to_string())?;
+            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&secret)
+                .map_err(|_| "HMAC 키 오류".to_string())?;
             mac.update(&message);
             Zeroizing::new(mac.finalize().into_bytes().to_vec())
         }
@@ -748,7 +828,11 @@ fn totp(entry: &OtpEntry, unix_seconds: u64) -> CommandResult<String> {
         | (u32::from(digest[offset + 2]) << 8)
         | u32::from(digest[offset + 3]);
     let modulus = 10_u32.pow(entry.digits);
-    Ok(format!("{:0width$}", binary % modulus, width = entry.digits as usize))
+    Ok(format!(
+        "{:0width$}",
+        binary % modulus,
+        width = entry.digits as usize
+    ))
 }
 
 fn now_seconds() -> CommandResult<u64> {
@@ -790,11 +874,18 @@ fn generate_password(
         (digits, b"0123456789".as_slice()),
         (symbols, b"!@#$%^&*()-_=+[]{}:,.?".as_slice()),
     ];
-    let selected = groups.iter().filter(|(enabled, _)| *enabled).map(|(_, chars)| *chars).collect::<Vec<_>>();
+    let selected = groups
+        .iter()
+        .filter(|(enabled, _)| *enabled)
+        .map(|(_, chars)| *chars)
+        .collect::<Vec<_>>();
     if selected.is_empty() {
         return Err("하나 이상의 문자 종류를 선택하세요.".into());
     }
-    let alphabet = selected.iter().flat_map(|group| group.iter().copied()).collect::<Vec<_>>();
+    let alphabet = selected
+        .iter()
+        .flat_map(|group| group.iter().copied())
+        .collect::<Vec<_>>();
     let mut password = Zeroizing::new(Vec::with_capacity(length));
     for group in &selected {
         password.push(group[secure_index(group.len())?]);
@@ -806,36 +897,62 @@ fn generate_password(
         let swap = secure_index(index + 1)?;
         password.swap(index, swap);
     }
-    let password = Zeroizing::new(String::from_utf8(password.to_vec()).map_err(|_| "암호 생성 실패".to_string())?);
+    let password = Zeroizing::new(
+        String::from_utf8(password.to_vec()).map_err(|_| "암호 생성 실패".to_string())?,
+    );
     Ok(password.to_string())
 }
 
 #[tauri::command]
-fn copy_generated_password(app: AppHandle, window: WebviewWindow, password: String) -> CommandResult<()> {
+fn copy_generated_password(
+    app: AppHandle,
+    window: WebviewWindow,
+    password: String,
+) -> CommandResult<()> {
     require_window(&window, "main")?;
     let password = Zeroizing::new(password);
     if password.len() > 512 || password.is_empty() {
         return Err("복사할 암호가 올바르지 않습니다.".into());
     }
-    app.clipboard().write_text(password.to_string()).map_err(|e| error("클립보드 쓰기 실패", e))
+    app.clipboard()
+        .write_text(password.to_string())
+        .map_err(|e| error("클립보드 쓰기 실패", e))
 }
 
 #[tauri::command]
-fn vault_status(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>) -> CommandResult<VaultStatus> {
+fn vault_status(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> CommandResult<VaultStatus> {
     require_window(&window, "main")?;
     let initialized = vault_path(&app)?.exists();
     let unlocked = {
-        let mut guard = state.session.lock().map_err(|_| "보안 상태 잠금 오류".to_string())?;
-        if guard.as_ref().is_some_and(|s| s.last_used.elapsed() >= SESSION_TIMEOUT) {
+        let mut guard = state
+            .session
+            .lock()
+            .map_err(|_| "보안 상태 잠금 오류".to_string())?;
+        if guard
+            .as_ref()
+            .is_some_and(|s| s.last_used.elapsed() >= SESSION_TIMEOUT)
+        {
             *guard = None;
         }
         guard.is_some()
     };
-    Ok(VaultStatus { initialized, unlocked })
+    Ok(VaultStatus {
+        initialized,
+        unlocked,
+    })
 }
 
 #[tauri::command]
-fn initialize_vault(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>, password: String) -> CommandResult<()> {
+fn initialize_vault(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    password: String,
+) -> CommandResult<()> {
     require_window(&window, "main")?;
     let password = Zeroizing::new(password);
     validate_password(&password)?;
@@ -847,32 +964,56 @@ fn initialize_vault(app: AppHandle, window: WebviewWindow, state: State<'_, AppS
     let key = derive_key(password.as_bytes(), &kdf)?;
     let envelope = encrypt_vault(&Vault::default(), &key, kdf, "vault")?;
     atomic_write(&path, &envelope)?;
-    let mut guard = state.session.lock().map_err(|_| "보안 상태 잠금 오류".to_string())?;
-    *guard = Some(SessionKey { key, last_used: Instant::now() });
+    let mut guard = state
+        .session
+        .lock()
+        .map_err(|_| "보안 상태 잠금 오류".to_string())?;
+    *guard = Some(SessionKey {
+        key,
+        last_used: Instant::now(),
+    });
     Ok(())
 }
 
 #[tauri::command]
-fn unlock_vault(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>, password: String) -> CommandResult<()> {
+fn unlock_vault(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    password: String,
+) -> CommandResult<()> {
     require_window(&window, "main")?;
     let password = Zeroizing::new(password);
     let envelope = read_envelope(&vault_path(&app)?)?;
     let key = derive_key(password.as_bytes(), &envelope.kdf)?;
     let _verified = decrypt_vault(&envelope, &key, "vault")?;
-    let mut guard = state.session.lock().map_err(|_| "보안 상태 잠금 오류".to_string())?;
-    *guard = Some(SessionKey { key, last_used: Instant::now() });
+    let mut guard = state
+        .session
+        .lock()
+        .map_err(|_| "보안 상태 잠금 오류".to_string())?;
+    *guard = Some(SessionKey {
+        key,
+        last_used: Instant::now(),
+    });
     Ok(())
 }
 
 #[tauri::command]
 fn lock_vault(window: WebviewWindow, state: State<'_, AppState>) -> CommandResult<()> {
     require_window(&window, "main")?;
-    *state.session.lock().map_err(|_| "보안 상태 잠금 오류".to_string())? = None;
+    *state
+        .session
+        .lock()
+        .map_err(|_| "보안 상태 잠금 오류".to_string())? = None;
     Ok(())
 }
 
 #[tauri::command]
-fn list_codes(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>) -> CommandResult<Vec<CodeView>> {
+fn list_codes(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> CommandResult<Vec<CodeView>> {
     require_window(&window, "main")?;
     with_session(&state, |key| {
         let (vault, _) = load_local(&app, key)?;
@@ -880,22 +1021,29 @@ fn list_codes(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>)
         vault
             .entries
             .iter()
-            .map(|entry| Ok(CodeView {
-                id: entry.id,
-                issuer: entry.issuer.clone(),
-                account: entry.account.clone(),
-                code: totp(entry, now)?,
-                period: entry.period,
-                remaining: entry.period - (now % entry.period),
-                icon: entry.icon.clone(),
-                brand_icon: entry.brand_icon.clone(),
-            }))
+            .map(|entry| {
+                Ok(CodeView {
+                    id: entry.id,
+                    issuer: entry.issuer.clone(),
+                    account: entry.account.clone(),
+                    code: totp(entry, now)?,
+                    period: entry.period,
+                    remaining: entry.period - (now % entry.period),
+                    icon: entry.icon.clone(),
+                    brand_icon: entry.brand_icon.clone(),
+                })
+            })
             .collect()
     })
 }
 
 #[tauri::command]
-fn add_otpauth_uri(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>, uri: String) -> CommandResult<EntryView> {
+fn add_otpauth_uri(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    uri: String,
+) -> CommandResult<EntryView> {
     require_window(&window, "main")?;
     let uri = Zeroizing::new(uri);
     let parsed = parse_otpauth(&uri)?;
@@ -903,7 +1051,12 @@ fn add_otpauth_uri(app: AppHandle, window: WebviewWindow, state: State<'_, AppSt
 }
 
 #[tauri::command]
-fn delete_entry(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>, id: Uuid) -> CommandResult<()> {
+fn delete_entry(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    id: Uuid,
+) -> CommandResult<()> {
     require_window(&window, "main")?;
     with_session(&state, |key| {
         let (mut vault, kdf) = load_local(&app, key)?;
@@ -933,7 +1086,10 @@ fn reorder_entries(
     }
     with_session(&state, |key| {
         let (mut vault, kdf) = load_local(&app, key)?;
-        if !selected.iter().all(|id| vault.entries.iter().any(|entry| entry.id == *id)) {
+        if !selected
+            .iter()
+            .all(|id| vault.entries.iter().any(|entry| entry.id == *id))
+        {
             return Err("순서를 변경할 인증키를 찾을 수 없습니다.".into());
         }
         let original = std::mem::take(&mut vault.entries);
@@ -949,7 +1105,11 @@ fn reorder_entries(
         }
         let mut reordered = ordered_ids
             .iter()
-            .map(|id| owned.remove(id).ok_or_else(|| "인증키 순서 정보가 올바르지 않습니다.".to_string()))
+            .map(|id| {
+                owned
+                    .remove(id)
+                    .ok_or_else(|| "인증키 순서 정보가 올바르지 않습니다.".to_string())
+            })
             .collect::<CommandResult<Vec<_>>>()?
             .into_iter();
         vault.entries = slots
@@ -982,7 +1142,9 @@ fn update_entry(
         .filter(|value| !value.is_empty());
     if brand_icon.as_ref().is_some_and(|value| {
         value.len() > 64
-            || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     }) {
         return Err("올바르지 않은 아이콘 식별자입니다.".into());
     }
@@ -1021,24 +1183,26 @@ fn update_entry(
 }
 
 #[tauri::command]
-fn choose_entry_icon(
-    app: AppHandle,
-    window: WebviewWindow,
-) -> CommandResult<Option<String>> {
+fn choose_entry_icon(app: AppHandle, window: WebviewWindow) -> CommandResult<Option<String>> {
     require_window(&window, "main")?;
     let selected = app
         .dialog()
         .file()
         .add_filter("Raster image", &["png", "jpg", "jpeg", "webp"])
         .blocking_pick_file();
-    let Some(path) = selected else { return Ok(None) };
-    let path = path.into_path().map_err(|_| "선택한 이미지 경로를 사용할 수 없습니다.".to_string())?;
+    let Some(path) = selected else {
+        return Ok(None);
+    };
+    let path = path
+        .into_path()
+        .map_err(|_| "선택한 이미지 경로를 사용할 수 없습니다.".to_string())?;
     let metadata = fs::metadata(&path).map_err(|e| error("아이콘 파일을 읽을 수 없습니다", e))?;
     if metadata.len() > 5 * 1024 * 1024 {
         return Err("아이콘 이미지는 5MB 이하여야 합니다.".into());
     }
     let source = fs::read(&path).map_err(|e| error("아이콘 파일을 읽을 수 없습니다", e))?;
-    let image = image::load_from_memory(&source).map_err(|e| error("지원하지 않거나 손상된 이미지", e))?;
+    let image =
+        image::load_from_memory(&source).map_err(|e| error("지원하지 않거나 손상된 이미지", e))?;
     if image.width() > 4096 || image.height() > 4096 {
         return Err("아이콘 이미지 해상도는 4096×4096 이하여야 합니다.".into());
     }
@@ -1107,7 +1271,8 @@ fn restore_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<(
         .get_webview_window("main")
         .ok_or_else(|| "메인 창을 찾을 수 없습니다.".to_string())?;
     main.show().map_err(|e| error("메인 창 표시 실패", e))?;
-    main.set_focus().map_err(|e| error("메인 창 포커스 실패", e))?;
+    main.set_focus()
+        .map_err(|e| error("메인 창 포커스 실패", e))?;
     window.hide().map_err(|e| error("미니 창 숨기기 실패", e))
 }
 
@@ -1118,18 +1283,33 @@ fn close_main_window(window: WebviewWindow) -> CommandResult<()> {
 }
 
 #[tauri::command]
-fn copy_code(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>, id: Uuid) -> CommandResult<()> {
+fn copy_code(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    id: Uuid,
+) -> CommandResult<()> {
     require_window(&window, "main")?;
     let code = with_session(&state, |key| {
         let (vault, _) = load_local(&app, key)?;
-        let entry = vault.entries.iter().find(|entry| entry.id == id).ok_or_else(|| "항목을 찾지 못했습니다.".to_string())?;
+        let entry = vault
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| "항목을 찾지 못했습니다.".to_string())?;
         totp(entry, now_seconds()?)
     })?;
-    app.clipboard().write_text(code).map_err(|e| error("클립보드 쓰기 실패", e))
+    app.clipboard()
+        .write_text(code)
+        .map_err(|e| error("클립보드 쓰기 실패", e))
 }
 
 #[tauri::command]
-fn get_backup_settings(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>) -> CommandResult<BackupSettingsView> {
+fn get_backup_settings(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> CommandResult<BackupSettingsView> {
     require_window(&window, "main")?;
     with_session(&state, |key| {
         let (vault, _) = load_local(&app, key)?;
@@ -1145,7 +1325,9 @@ fn get_backup_settings(app: AppHandle, window: WebviewWindow, state: State<'_, A
 fn choose_backup_directory(app: AppHandle, window: WebviewWindow) -> CommandResult<Option<String>> {
     require_window(&window, "main")?;
     let selected = app.dialog().file().blocking_pick_folder();
-    let Some(path) = selected else { return Ok(None) };
+    let Some(path) = selected else {
+        return Ok(None);
+    };
     let path = path
         .into_path()
         .map_err(|_| "선택한 백업 폴더 경로를 사용할 수 없습니다.".to_string())?;
@@ -1179,7 +1361,12 @@ fn save_backup_settings(
 }
 
 #[tauri::command]
-fn export_backup(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>, password: String) -> CommandResult<bool> {
+fn export_backup(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    password: String,
+) -> CommandResult<bool> {
     require_window(&window, "main")?;
     let password = Zeroizing::new(password);
     validate_password(&password)?;
@@ -1195,14 +1382,23 @@ fn export_backup(app: AppHandle, window: WebviewWindow, state: State<'_, AppStat
         .add_filter("Secretary encrypted backup", &["enc"])
         .set_file_name("secretary-backup.enc")
         .blocking_save_file();
-    let Some(path) = selected else { return Ok(false) };
-    let path = path.into_path().map_err(|_| "선택한 경로를 사용할 수 없습니다.".to_string())?;
+    let Some(path) = selected else {
+        return Ok(false);
+    };
+    let path = path
+        .into_path()
+        .map_err(|_| "선택한 경로를 사용할 수 없습니다.".to_string())?;
     atomic_write(&path, &envelope)?;
     Ok(true)
 }
 
 #[tauri::command]
-fn import_backup(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>, password: String) -> CommandResult<bool> {
+fn import_backup(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    password: String,
+) -> CommandResult<bool> {
     require_window(&window, "main")?;
     let password = Zeroizing::new(password);
     let selected = app
@@ -1210,8 +1406,12 @@ fn import_backup(app: AppHandle, window: WebviewWindow, state: State<'_, AppStat
         .file()
         .add_filter("Secretary encrypted backup", &["enc"])
         .blocking_pick_file();
-    let Some(path) = selected else { return Ok(false) };
-    let path = path.into_path().map_err(|_| "선택한 경로를 사용할 수 없습니다.".to_string())?;
+    let Some(path) = selected else {
+        return Ok(false);
+    };
+    let path = path
+        .into_path()
+        .map_err(|_| "선택한 경로를 사용할 수 없습니다.".to_string())?;
     let backup = read_envelope(&path)?;
     let backup_key = derive_key(password.as_bytes(), &backup.kdf)?;
     let imported = decrypt_vault(&backup, &backup_key, "backup")?;
@@ -1223,13 +1423,22 @@ fn import_backup(app: AppHandle, window: WebviewWindow, state: State<'_, AppStat
 }
 
 #[tauri::command]
-async fn open_scanner(app: AppHandle, window: WebviewWindow, state: State<'_, AppState>) -> CommandResult<()> {
+async fn open_scanner(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> CommandResult<()> {
     require_window(&window, "main")?;
     with_session(&state, |_| Ok(()))?;
     if let Some(scanner) = app.get_webview_window("scanner") {
-        scanner.close().map_err(|e| error("기존 스캐너 닫기 실패", e))?;
+        scanner
+            .close()
+            .map_err(|e| error("기존 스캐너 닫기 실패", e))?;
     }
-    let monitor = window.current_monitor().map_err(|e| error("현재 모니터 확인 실패", e))?.ok_or_else(|| "현재 모니터를 찾을 수 없습니다.".to_string())?;
+    let monitor = window
+        .current_monitor()
+        .map_err(|e| error("현재 모니터 확인 실패", e))?
+        .ok_or_else(|| "현재 모니터를 찾을 수 없습니다.".to_string())?;
     let position = monitor.position();
     let scanner = WebviewWindowBuilder::new(&app, "scanner", WebviewUrl::App("index.html".into()))
         .title("QR 영역 선택")
@@ -1248,8 +1457,12 @@ async fn open_scanner(app: AppHandle, window: WebviewWindow, state: State<'_, Ap
     scanner
         .set_fullscreen(true)
         .map_err(|e| error("QR 스캐너 전체화면 설정 실패", e))?;
-    scanner.show().map_err(|e| error("QR 스캐너 표시 실패", e))?;
-    scanner.set_focus().map_err(|e| error("QR 스캐너 포커스 실패", e))?;
+    scanner
+        .show()
+        .map_err(|e| error("QR 스캐너 표시 실패", e))?;
+    scanner
+        .set_focus()
+        .map_err(|e| error("QR 스캐너 포커스 실패", e))?;
     Ok(())
 }
 
@@ -1283,7 +1496,8 @@ fn scan_screen_region(
     let result = (|| {
         let global_x = i64::from(origin.x) + i64::from(x);
         let global_y = i64::from(origin.y) + i64::from(y);
-        let monitor = Monitor::from_point(global_x as i32, global_y as i32).map_err(|e| error("캡처 모니터 확인 실패", e))?;
+        let monitor = Monitor::from_point(global_x as i32, global_y as i32)
+            .map_err(|e| error("캡처 모니터 확인 실패", e))?;
         let mx = monitor.x().map_err(|e| error("모니터 좌표 확인 실패", e))?;
         let my = monitor.y().map_err(|e| error("모니터 좌표 확인 실패", e))?;
         let local_x = global_x - i64::from(mx);
@@ -1308,7 +1522,8 @@ fn scan_screen_region(
     })();
     match result {
         Ok(summary) => {
-            app.emit_to("main", "vault-changed", summary.clone()).map_err(|e| error("화면 갱신 이벤트 실패", e))?;
+            app.emit_to("main", "vault-changed", summary.clone())
+                .map_err(|e| error("화면 갱신 이벤트 실패", e))?;
             window.close().map_err(|e| error("스캐너 닫기 실패", e))?;
             Ok(summary)
         }
@@ -1322,6 +1537,8 @@ fn scan_screen_region(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::default())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1380,7 +1597,10 @@ mod tests {
     fn encryption_round_trip_and_tamper_detection() {
         let kdf = new_kdf_config().unwrap();
         let key = derive_key(b"correct horse battery staple", &kdf).unwrap();
-        let vault = Vault { entries: vec![], backup: BackupSettings::default() };
+        let vault = Vault {
+            entries: vec![],
+            backup: BackupSettings::default(),
+        };
         let mut envelope = encrypt_vault(&vault, &key, kdf, "vault").unwrap();
         assert!(decrypt_vault(&envelope, &key, "vault").is_ok());
         envelope.ciphertext.push('A');

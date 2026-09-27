@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   createElement as createLucideIcon,
   Copy,
@@ -94,6 +96,8 @@ let searchQuery = "";
 let dragInProgress = false;
 let draggedCard: HTMLElement | null = null;
 let suppressCopyUntil = 0;
+let checkingUpdate = false;
+let updatePromptShown = false;
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string) {
   const node = document.createElement(tag);
@@ -327,6 +331,10 @@ function showSettingsMenu(anchor: HTMLElement) {
   const layer = el("div", "popup-menu-layer");
   const menu = el("div", "popup-menu settings-menu");
   menu.append(
+    symbolButton("업데이트 확인", RefreshCw, () => {
+      layer.remove();
+      void checkForUpdates(true);
+    }, "popup-menu-action"),
     symbolButton("백업 및 복구", FolderClock, () => {
       layer.remove();
       void backupCenterDialog();
@@ -346,6 +354,86 @@ function showSettingsMenu(anchor: HTMLElement) {
   layer.addEventListener("pointerdown", (event) => {
     if (event.target === layer) layer.remove();
   });
+}
+
+function updateDialog(update: Update) {
+  if (updatePromptShown) return;
+  updatePromptShown = true;
+  const body = el("div", "stack update-dialog-body");
+  body.append(
+    el("p", "update-version", `Secretary ${update.version}`),
+    el("p", "muted", "새 버전이 준비되었습니다."),
+  );
+  const notes = el("div", "update-notes", update.body?.trim() || "이번 릴리스의 변경 사항이 제공되지 않았습니다.");
+  const progress = el("progress", "update-progress") as HTMLProgressElement;
+  progress.max = 100;
+  progress.value = 0;
+  progress.hidden = true;
+  const status = el("p", "muted update-status");
+  const actions = el("div", "update-actions");
+  const later = el("button", "ghost", "나중에") as HTMLButtonElement;
+  later.type = "button";
+  const install = el("button", "primary", "업데이트") as HTMLButtonElement;
+  install.type = "button";
+  actions.append(later, install);
+  body.append(notes, progress, status, actions);
+  const dialog = modal("업데이트", body);
+  dialog.addEventListener("mousedown", (event) => {
+    if (event.target === dialog) updatePromptShown = false;
+  });
+  const close = () => {
+    updatePromptShown = false;
+    dialog.remove();
+  };
+  later.addEventListener("click", close);
+  dialog.querySelector<HTMLButtonElement>(".modal-head .icon-button")?.addEventListener("click", () => {
+    updatePromptShown = false;
+  });
+  install.addEventListener("click", async () => {
+    install.disabled = true;
+    later.disabled = true;
+    progress.hidden = false;
+    status.textContent = "업데이트를 다운로드하고 있습니다.";
+    let downloaded = 0;
+    let total = 0;
+    try {
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? 0;
+          progress.removeAttribute("value");
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          if (total > 0) {
+            progress.value = Math.min(100, (downloaded / total) * 100);
+          }
+        } else if (event.event === "Finished") {
+          progress.value = 100;
+          status.textContent = "설치가 완료되었습니다. 다시 시작합니다.";
+        }
+      });
+      await relaunch();
+    } catch (error) {
+      install.disabled = false;
+      later.disabled = false;
+      progress.hidden = true;
+      status.textContent = "";
+      toast(`업데이트 실패: ${String(error)}`, "error");
+    }
+  });
+}
+
+async function checkForUpdates(manual = false) {
+  if (checkingUpdate) return;
+  checkingUpdate = true;
+  try {
+    const update = await check();
+    if (update) updateDialog(update);
+    else if (manual) toast("현재 최신 버전을 사용하고 있습니다.");
+  } catch (error) {
+    if (manual) toast(`업데이트 확인 실패: ${String(error)}`, "error");
+  } finally {
+    checkingUpdate = false;
+  }
 }
 
 async function backupCenterDialog() {
@@ -1063,6 +1151,7 @@ async function bootstrap() {
   });
   const status = await invoke<VaultStatus>("vault_status");
   status.unlocked ? await showVault() : passwordPanel(status.initialized);
+  window.setTimeout(() => void checkForUpdates(false), 1200);
 }
 
 void bootstrap();
