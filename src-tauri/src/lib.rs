@@ -12,13 +12,13 @@ use hmac::{Hmac, Mac};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
-use sha2::{Sha256, Sha512};
+use sha2::{Digest as ShaDigest, Sha256, Sha512};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Cursor,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
@@ -36,6 +36,10 @@ const BIOMETRIC_SERVICE: &str = "dev.sentinel.totp";
 const BIOMETRIC_ACCOUNT: &str = "vault-key";
 const AAD: &[u8] = b"sentinel-totp:v1:vault";
 const BACKUP_AAD: &[u8] = b"sentinel-totp:v1:backup";
+const V2_VAULT_AAD: &[u8] = b"secretary:v2:vault";
+const V2_BACKUP_AAD: &[u8] = b"secretary:v2:backup";
+const KEY_WRAP_AAD: &[u8] = b"secretary:v2:keywrap";
+const VAULT_FORMAT_VERSION: u8 = 2;
 const KDF_MEMORY_KIB: u32 = 65_536;
 const KDF_ITERATIONS: u32 = 3;
 const KDF_PARALLELISM: u32 = 1;
@@ -51,6 +55,7 @@ type CommandResult<T> = Result<T, String>;
 #[derive(Default)]
 struct AppState {
     session: Mutex<Option<SessionKey>>,
+    pending_restore: Arc<Mutex<Option<PendingRestore>>>,
 }
 
 struct SessionKey {
@@ -72,16 +77,57 @@ struct EncryptedEnvelope {
     version: u8,
     kind: String,
     kdf: KdfConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_nonce: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wrapped_key: Option<String>,
     nonce: String,
     ciphertext: String,
 }
 
-#[derive(Default, Serialize, Deserialize, Zeroize)]
+#[derive(Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 struct Vault {
+    #[serde(default = "new_vault_id")]
+    #[zeroize(skip)]
+    vault_id: Uuid,
+    #[serde(default)]
+    #[zeroize(skip)]
+    revision: u64,
     entries: Vec<OtpEntry>,
     #[serde(default)]
     backup: BackupSettings,
+}
+
+fn new_vault_id() -> Uuid {
+    Uuid::new_v4()
+}
+
+impl Default for Vault {
+    fn default() -> Self {
+        Self {
+            vault_id: new_vault_id(),
+            revision: 0,
+            entries: Vec::new(),
+            backup: BackupSettings::default(),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum VaultCryptoContext {
+    Legacy(KdfConfig),
+    Envelope {
+        kdf: KdfConfig,
+        key_nonce: String,
+        wrapped_key: String,
+    },
+}
+
+struct PendingRestore {
+    token: Uuid,
+    vault: Vault,
+    created_at: Instant,
 }
 
 #[derive(Serialize, Deserialize, Zeroize)]
@@ -121,7 +167,7 @@ struct OtpEntry {
     favorite: bool,
 }
 
-#[derive(Copy, Clone, Serialize, Deserialize, Zeroize)]
+#[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
 #[serde(rename_all = "UPPERCASE")]
 enum TotpAlgorithm {
     Sha1,
@@ -159,7 +205,37 @@ struct BackupStatusView {
     healthy: bool,
     file_count: usize,
     last_backup_at: Option<u64>,
+    entry_count: Option<usize>,
+    size_bytes: Option<u64>,
+    sha256: Option<String>,
     message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestorePreviewEntry {
+    issuer: String,
+    account: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestorePreview {
+    token: Uuid,
+    source_entries: usize,
+    new_entries: usize,
+    duplicate_entries: usize,
+    conflicting_entries: usize,
+    entries: Vec<RestorePreviewEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreResult {
+    restored_entries: usize,
+    skipped_entries: usize,
+    mode: String,
 }
 
 #[derive(Serialize)]
@@ -506,13 +582,23 @@ fn derive_key(password: &[u8], config: &KdfConfig) -> CommandResult<Zeroizing<[u
     Ok(key)
 }
 
-fn encrypt_vault(
+fn aad_for(version: u8, kind: &str) -> CommandResult<&'static [u8]> {
+    match (version, kind) {
+        (1, "vault") => Ok(AAD),
+        (1, "backup") => Ok(BACKUP_AAD),
+        (VAULT_FORMAT_VERSION, "vault") => Ok(V2_VAULT_AAD),
+        (VAULT_FORMAT_VERSION, "backup") => Ok(V2_BACKUP_AAD),
+        _ => Err("지원하지 않는 암호화 파일 형식입니다.".into()),
+    }
+}
+
+fn encrypt_vault_legacy(
     vault: &Vault,
     key: &[u8; 32],
     kdf: KdfConfig,
     kind: &str,
 ) -> CommandResult<EncryptedEnvelope> {
-    let aad = if kind == "backup" { BACKUP_AAD } else { AAD };
+    let aad = aad_for(1, kind)?;
     let plaintext =
         Zeroizing::new(serde_json::to_vec(vault).map_err(|e| error("금고 직렬화 실패", e))?);
     let nonce_bytes = random_bytes::<12>()?;
@@ -531,9 +617,131 @@ fn encrypt_vault(
         version: 1,
         kind: kind.into(),
         kdf,
+        key_nonce: None,
+        wrapped_key: None,
         nonce: B64.encode(nonce_bytes),
         ciphertext: B64.encode(ciphertext),
     })
+}
+
+fn wrap_data_key(data_key: &[u8; 32], kek: &[u8; 32]) -> CommandResult<(String, String)> {
+    let nonce = random_bytes::<12>()?;
+    let cipher = Aes256Gcm::new_from_slice(kek)
+        .map_err(|_| "키 암호화 키의 길이가 올바르지 않습니다.".to_string())?;
+    let wrapped = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: data_key,
+                aad: KEY_WRAP_AAD,
+            },
+        )
+        .map_err(|_| "데이터 암호화 키 보호에 실패했습니다.".to_string())?;
+    Ok((B64.encode(nonce), B64.encode(wrapped)))
+}
+
+fn unwrap_data_key(
+    envelope: &EncryptedEnvelope,
+    kek: &[u8; 32],
+) -> CommandResult<Zeroizing<[u8; 32]>> {
+    if envelope.version != VAULT_FORMAT_VERSION {
+        return Err("DEK를 포함하지 않는 구형 금고입니다.".into());
+    }
+    let nonce = B64
+        .decode(
+            envelope
+                .key_nonce
+                .as_deref()
+                .ok_or_else(|| "DEK nonce가 없습니다.".to_string())?,
+        )
+        .map_err(|_| "DEK nonce가 손상되었습니다.".to_string())?;
+    if nonce.len() != 12 {
+        return Err("DEK nonce 길이가 올바르지 않습니다.".into());
+    }
+    let wrapped = Zeroizing::new(
+        B64.decode(
+            envelope
+                .wrapped_key
+                .as_deref()
+                .ok_or_else(|| "암호화된 DEK가 없습니다.".to_string())?,
+        )
+        .map_err(|_| "암호화된 DEK가 손상되었습니다.".to_string())?,
+    );
+    let cipher = Aes256Gcm::new_from_slice(kek)
+        .map_err(|_| "키 암호화 키의 길이가 올바르지 않습니다.".to_string())?;
+    let unwrapped = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &wrapped,
+                    aad: KEY_WRAP_AAD,
+                },
+            )
+            .map_err(|_| "비밀번호가 틀렸거나 DEK가 손상되었습니다.".to_string())?,
+    );
+    let key: [u8; 32] = unwrapped
+        .as_slice()
+        .try_into()
+        .map_err(|_| "복호화된 DEK 길이가 올바르지 않습니다.".to_string())?;
+    Ok(Zeroizing::new(key))
+}
+
+fn encrypt_vault_v2(
+    vault: &Vault,
+    data_key: &[u8; 32],
+    context: &VaultCryptoContext,
+    kind: &str,
+) -> CommandResult<EncryptedEnvelope> {
+    let VaultCryptoContext::Envelope {
+        kdf,
+        key_nonce,
+        wrapped_key,
+    } = context
+    else {
+        return Err("v2 암호화 컨텍스트가 필요합니다.".into());
+    };
+    let plaintext =
+        Zeroizing::new(serde_json::to_vec(vault).map_err(|e| error("금고 직렬화 실패", e))?);
+    let nonce = random_bytes::<12>()?;
+    let cipher = Aes256Gcm::new_from_slice(data_key)
+        .map_err(|_| "DEK 길이가 올바르지 않습니다.".to_string())?;
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: aad_for(VAULT_FORMAT_VERSION, kind)?,
+            },
+        )
+        .map_err(|_| "금고 암호화에 실패했습니다.".to_string())?;
+    Ok(EncryptedEnvelope {
+        version: VAULT_FORMAT_VERSION,
+        kind: kind.into(),
+        kdf: kdf.clone(),
+        key_nonce: Some(key_nonce.clone()),
+        wrapped_key: Some(wrapped_key.clone()),
+        nonce: B64.encode(nonce),
+        ciphertext: B64.encode(ciphertext),
+    })
+}
+
+fn create_v2_envelope(
+    vault: &Vault,
+    password: &[u8],
+    kind: &str,
+) -> CommandResult<(EncryptedEnvelope, Zeroizing<[u8; 32]>)> {
+    let kdf = new_kdf_config()?;
+    let kek = derive_key(password, &kdf)?;
+    let data_key = Zeroizing::new(random_bytes::<32>()?);
+    let (key_nonce, wrapped_key) = wrap_data_key(&data_key, &kek)?;
+    let context = VaultCryptoContext::Envelope {
+        kdf,
+        key_nonce,
+        wrapped_key,
+    };
+    let envelope = encrypt_vault_v2(vault, &data_key, &context, kind)?;
+    Ok((envelope, data_key))
 }
 
 fn decrypt_vault(
@@ -541,7 +749,7 @@ fn decrypt_vault(
     key: &[u8; 32],
     expected_kind: &str,
 ) -> CommandResult<Vault> {
-    if envelope.version != 1 || envelope.kind != expected_kind {
+    if !matches!(envelope.version, 1 | VAULT_FORMAT_VERSION) || envelope.kind != expected_kind {
         return Err("지원하지 않는 금고 형식입니다.".into());
     }
     let nonce = B64
@@ -554,11 +762,7 @@ fn decrypt_vault(
         B64.decode(&envelope.ciphertext)
             .map_err(|_| "암호문이 손상되었습니다.".to_string())?,
     );
-    let aad = if expected_kind == "backup" {
-        BACKUP_AAD
-    } else {
-        AAD
-    };
+    let aad = aad_for(envelope.version, expected_kind)?;
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|_| "복호화 키가 올바르지 않습니다.".to_string())?;
     let plaintext = Zeroizing::new(
@@ -572,7 +776,71 @@ fn decrypt_vault(
             )
             .map_err(|_| "암호가 틀렸거나 파일이 변조되었습니다.".to_string())?,
     );
-    serde_json::from_slice(&plaintext).map_err(|e| error("복호화 데이터 형식 오류", e))
+    let vault: Vault =
+        serde_json::from_slice(&plaintext).map_err(|e| error("복호화 데이터 형식 오류", e))?;
+    validate_vault(&vault)?;
+    Ok(vault)
+}
+
+fn unlock_envelope(
+    envelope: &EncryptedEnvelope,
+    password: &[u8],
+    expected_kind: &str,
+) -> CommandResult<(Vault, Zeroizing<[u8; 32]>)> {
+    let kek = derive_key(password, &envelope.kdf)?;
+    let data_key = if envelope.version == 1 {
+        kek
+    } else {
+        unwrap_data_key(envelope, &kek)?
+    };
+    let vault = decrypt_vault(envelope, &data_key, expected_kind)?;
+    Ok((vault, data_key))
+}
+
+fn crypto_context(envelope: &EncryptedEnvelope) -> CommandResult<VaultCryptoContext> {
+    if envelope.version == 1 {
+        return Ok(VaultCryptoContext::Legacy(envelope.kdf.clone()));
+    }
+    if envelope.version != VAULT_FORMAT_VERSION {
+        return Err("지원하지 않는 금고 버전입니다.".into());
+    }
+    Ok(VaultCryptoContext::Envelope {
+        kdf: envelope.kdf.clone(),
+        key_nonce: envelope
+            .key_nonce
+            .clone()
+            .ok_or_else(|| "DEK nonce가 없습니다.".to_string())?,
+        wrapped_key: envelope
+            .wrapped_key
+            .clone()
+            .ok_or_else(|| "암호화된 DEK가 없습니다.".to_string())?,
+    })
+}
+
+fn validate_vault(vault: &Vault) -> CommandResult<()> {
+    if vault.vault_id.is_nil() {
+        return Err("금고 식별자가 올바르지 않습니다.".into());
+    }
+    if vault.entries.len() > 10_000 {
+        return Err("금고 항목 수가 허용 범위를 초과합니다.".into());
+    }
+    let mut ids = HashSet::with_capacity(vault.entries.len());
+    for entry in &vault.entries {
+        if !ids.insert(entry.id) {
+            return Err("금고에 중복된 항목 식별자가 있습니다.".into());
+        }
+        if entry.account.trim().is_empty()
+            || entry.account.len() > 1024
+            || entry.issuer.len() > 1024
+        {
+            return Err("금고 항목의 이름 또는 계정이 올바르지 않습니다.".into());
+        }
+        normalize_secret(&entry.secret)?;
+    }
+    if !(1..=100).contains(&vault.backup.retention) {
+        return Err("백업 보관 개수가 올바르지 않습니다.".into());
+    }
+    Ok(())
 }
 
 fn read_envelope(path: &Path) -> CommandResult<EncryptedEnvelope> {
@@ -584,54 +852,133 @@ fn read_envelope(path: &Path) -> CommandResult<EncryptedEnvelope> {
     serde_json::from_slice(&bytes).map_err(|e| error("암호화 파일 형식 오류", e))
 }
 
-fn atomic_write(path: &Path, envelope: &EncryptedEnvelope) -> CommandResult<()> {
-    let bytes = serde_json::to_vec(envelope).map_err(|e| error("암호화 파일 직렬화 실패", e))?;
+fn file_sha256(path: &Path) -> CommandResult<String> {
+    let bytes = fs::read(path).map_err(|e| error("백업 파일 해시 읽기 실패", e))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn backup_sidecar_path(path: &Path) -> CommandResult<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "저장 파일 이름이 올바르지 않습니다.".to_string())?;
+    Ok(path.with_file_name(format!("{name}.bak")))
+}
+
+fn write_temporary_file(path: &Path, bytes: &[u8]) -> CommandResult<PathBuf> {
     let parent = path
         .parent()
         .ok_or_else(|| "저장 폴더가 올바르지 않습니다.".to_string())?;
     fs::create_dir_all(parent).map_err(|e| error("저장 폴더 생성 실패", e))?;
     let temp = parent.join(format!(".secretary-{}.tmp", Uuid::new_v4()));
 
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)
-            .map_err(|e| error("임시 파일 생성 실패", e))?;
-        file.write_all(&bytes)
-            .map_err(|e| error("임시 파일 쓰기 실패", e))?;
-        file.sync_all()
-            .map_err(|e| error("임시 파일 동기화 실패", e))?;
+        options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|e| error("임시 파일 생성 실패", e))?;
-        file.write_all(&bytes)
-            .map_err(|e| error("임시 파일 쓰기 실패", e))?;
-        file.sync_all()
-            .map_err(|e| error("임시 파일 동기화 실패", e))?;
-    }
+    let mut file = options
+        .open(&temp)
+        .map_err(|e| error("임시 파일 생성 실패", e))?;
+    file.write_all(bytes)
+        .map_err(|e| error("임시 파일 쓰기 실패", e))?;
+    file.sync_all()
+        .map_err(|e| error("임시 파일 디스크 동기화 실패", e))?;
+    Ok(temp)
+}
 
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| {
-            let _ = fs::remove_file(&temp);
-            error("기존 암호화 파일 교체 실패", e)
-        })?;
+#[cfg(windows)]
+fn replace_file_atomically(path: &Path, temp: &Path, backup: &Path) -> CommandResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        core::PCWSTR,
+        Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS},
+    };
+
+    if !path.exists() {
+        return fs::rename(temp, path).map_err(|e| error("암호화 파일 저장 실패", e));
     }
-    fs::rename(&temp, path).map_err(|e| {
-        let _ = fs::remove_file(&temp);
-        error("암호화 파일 저장 실패", e)
-    })?;
+    if backup.exists() {
+        fs::remove_file(backup).map_err(|e| error("이전 복구 파일 정리 실패", e))?;
+    }
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let temp_wide = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let backup_wide = backup
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(path_wide.as_ptr()),
+            PCWSTR(temp_wide.as_ptr()),
+            PCWSTR(backup_wide.as_ptr()),
+            REPLACE_FILE_FLAGS(0),
+            None,
+            None,
+        )
+        .map_err(|e| error("Windows 원자적 파일 교체 실패", e))
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(path: &Path, temp: &Path, backup: &Path) -> CommandResult<()> {
+    if path.exists() {
+        let backup_temp =
+            backup.with_file_name(format!(".secretary-backup-{}.tmp", Uuid::new_v4()));
+        fs::copy(path, &backup_temp).map_err(|e| error("복구 파일 생성 실패", e))?;
+        fs::File::open(&backup_temp)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| error("복구 파일 디스크 동기화 실패", e))?;
+        fs::rename(&backup_temp, backup).map_err(|e| error("복구 파일 교체 실패", e))?;
+    }
+    fs::rename(temp, path).map_err(|e| error("암호화 파일 원자적 교체 실패", e))?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| error("저장 폴더 디스크 동기화 실패", e))?;
+    }
     Ok(())
+}
+
+fn atomic_write_verified(
+    path: &Path,
+    envelope: &EncryptedEnvelope,
+    data_key: &[u8; 32],
+    expected_kind: &str,
+    expected: &Vault,
+) -> CommandResult<()> {
+    let bytes = serde_json::to_vec(envelope).map_err(|e| error("암호화 파일 직렬화 실패", e))?;
+    let temp = write_temporary_file(path, &bytes)?;
+    let verification = (|| {
+        let written = read_envelope(&temp)?;
+        let restored = decrypt_vault(&written, data_key, expected_kind)?;
+        if restored.vault_id != expected.vault_id
+            || restored.revision != expected.revision
+            || restored.entries.len() != expected.entries.len()
+        {
+            return Err("쓰기 후 금고 검증 결과가 원본과 일치하지 않습니다.".into());
+        }
+        Ok(())
+    })();
+    if let Err(err) = verification {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
+    }
+    let backup = backup_sidecar_path(path)?;
+    replace_file_atomically(path, &temp, &backup).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
 }
 
 fn with_session<T>(
@@ -664,28 +1011,167 @@ fn schedule_clipboard_clear(app: AppHandle, copied: Zeroizing<String>) {
     });
 }
 
-fn load_local(app: &AppHandle, key: &[u8; 32]) -> CommandResult<(Vault, KdfConfig)> {
-    let envelope = read_envelope(&vault_path(app)?)?;
-    let vault = decrypt_vault(&envelope, key, "vault")?;
-    Ok((vault, envelope.kdf))
+fn load_local(app: &AppHandle, key: &[u8; 32]) -> CommandResult<(Vault, VaultCryptoContext)> {
+    let path = vault_path(app)?;
+    let primary = read_envelope(&path)
+        .and_then(|envelope| decrypt_vault(&envelope, key, "vault").map(|vault| (envelope, vault)));
+    match primary {
+        Ok((envelope, vault)) => Ok((vault, crypto_context(&envelope)?)),
+        Err(primary_error) => {
+            let backup_path = backup_sidecar_path(&path)?;
+            let backup = read_envelope(&backup_path).and_then(|envelope| {
+                decrypt_vault(&envelope, key, "vault").map(|vault| (envelope, vault))
+            });
+            let (envelope, vault) = backup.map_err(|backup_error| {
+                format!(
+                    "금고와 복구 파일을 모두 열 수 없습니다. 금고 오류: {primary_error}; 복구 파일 오류: {backup_error}"
+                )
+            })?;
+            atomic_write_verified(&path, &envelope, key, "vault", &vault)?;
+            Ok((vault, crypto_context(&envelope)?))
+        }
+    }
 }
 
-fn save_local(app: &AppHandle, key: &[u8; 32], kdf: KdfConfig, vault: &Vault) -> CommandResult<()> {
-    let envelope = encrypt_vault(vault, key, kdf.clone(), "vault")?;
-    atomic_write(&vault_path(app)?, &envelope)?;
-    if vault.backup.automatic_file {
-        write_automatic_file_backup(vault, key, kdf)?;
+fn unlock_local_with_password(
+    app: &AppHandle,
+    password: &[u8],
+) -> CommandResult<(EncryptedEnvelope, Vault, Zeroizing<[u8; 32]>)> {
+    let path = vault_path(app)?;
+    let unlock_path = |candidate: &Path| {
+        let envelope = read_envelope(candidate)?;
+        let (vault, key) = unlock_envelope(&envelope, password, "vault")?;
+        Ok::<_, String>((envelope, vault, key))
+    };
+    match unlock_path(&path) {
+        Ok(result) => Ok(result),
+        Err(primary_error) => {
+            let backup_path = backup_sidecar_path(&path)?;
+            let (envelope, vault, key) = unlock_path(&backup_path).map_err(|backup_error| {
+                format!(
+                    "금고와 복구 파일을 모두 열 수 없습니다. 금고 오류: {primary_error}; 복구 파일 오류: {backup_error}"
+                )
+            })?;
+            atomic_write_verified(&path, &envelope, &key, "vault", &vault)?;
+            Ok((envelope, vault, key))
+        }
     }
+}
+
+fn save_local(
+    app: &AppHandle,
+    key: &[u8; 32],
+    context: VaultCryptoContext,
+    vault: &mut Vault,
+) -> CommandResult<()> {
+    vault.revision = vault
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| "금고 revision이 허용 범위를 초과했습니다.".to_string())?;
+    validate_vault(vault)?;
+    let envelope = match &context {
+        VaultCryptoContext::Legacy(kdf) => encrypt_vault_legacy(vault, key, kdf.clone(), "vault")?,
+        VaultCryptoContext::Envelope { .. } => encrypt_vault_v2(vault, key, &context, "vault")?,
+    };
+    if vault.backup.automatic_file {
+        write_automatic_file_backup(vault, key, &context)?;
+    }
+    atomic_write_verified(&vault_path(app)?, &envelope, key, "vault", vault)?;
     Ok(())
 }
 
 fn prepare_restored_vault(mut imported: Vault, mut local: Vault) -> (Vault, usize) {
     imported.backup = std::mem::take(&mut local.backup);
+    imported.vault_id = local.vault_id;
+    imported.revision = local.revision;
     let restored_entries = imported.entries.len();
     (imported, restored_entries)
 }
 
-fn write_automatic_file_backup(vault: &Vault, key: &[u8; 32], kdf: KdfConfig) -> CommandResult<()> {
+fn same_entry(left: &OtpEntry, right: &OtpEntry) -> bool {
+    left.issuer.eq_ignore_ascii_case(&right.issuer)
+        && left.account.eq_ignore_ascii_case(&right.account)
+        && left.secret == right.secret
+        && left.digits == right.digits
+        && left.period == right.period
+        && left.algorithm == right.algorithm
+}
+
+fn same_label(left: &OtpEntry, right: &OtpEntry) -> bool {
+    left.issuer.eq_ignore_ascii_case(&right.issuer)
+        && left.account.eq_ignore_ascii_case(&right.account)
+}
+
+fn make_restore_preview(token: Uuid, imported: &Vault, local: &Vault) -> RestorePreview {
+    let mut new_entries = 0;
+    let mut duplicate_entries = 0;
+    let mut conflicting_entries = 0;
+    let entries = imported
+        .entries
+        .iter()
+        .take(500)
+        .map(|entry| {
+            let status = if local
+                .entries
+                .iter()
+                .any(|current| same_entry(current, entry))
+            {
+                duplicate_entries += 1;
+                "duplicate"
+            } else if local
+                .entries
+                .iter()
+                .any(|current| same_label(current, entry))
+            {
+                conflicting_entries += 1;
+                "conflict"
+            } else {
+                new_entries += 1;
+                "new"
+            };
+            RestorePreviewEntry {
+                issuer: entry.issuer.clone(),
+                account: entry.account.clone(),
+                status: status.into(),
+            }
+        })
+        .collect();
+
+    if imported.entries.len() > 500 {
+        for entry in &imported.entries[500..] {
+            if local
+                .entries
+                .iter()
+                .any(|current| same_entry(current, entry))
+            {
+                duplicate_entries += 1;
+            } else if local
+                .entries
+                .iter()
+                .any(|current| same_label(current, entry))
+            {
+                conflicting_entries += 1;
+            } else {
+                new_entries += 1;
+            }
+        }
+    }
+
+    RestorePreview {
+        token,
+        source_entries: imported.entries.len(),
+        new_entries,
+        duplicate_entries,
+        conflicting_entries,
+        entries,
+    }
+}
+
+fn write_automatic_file_backup(
+    vault: &Vault,
+    key: &[u8; 32],
+    context: &VaultCryptoContext,
+) -> CommandResult<()> {
     let directory = PathBuf::from(&vault.backup.directory);
     if !directory.is_dir() {
         return Err("자동 백업 폴더를 찾을 수 없습니다.".into());
@@ -694,9 +1180,12 @@ fn write_automatic_file_backup(vault: &Vault, key: &[u8; 32], kdf: KdfConfig) ->
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "시스템 시간이 올바르지 않습니다.".to_string())?
         .as_millis();
-    let envelope = encrypt_vault(vault, key, kdf, "backup")?;
+    let envelope = match context {
+        VaultCryptoContext::Legacy(kdf) => encrypt_vault_legacy(vault, key, kdf.clone(), "backup")?,
+        VaultCryptoContext::Envelope { .. } => encrypt_vault_v2(vault, key, context, "backup")?,
+    };
     let path = directory.join(format!("secretary-auto-{timestamp}.enc"));
-    atomic_write(&path, &envelope)?;
+    atomic_write_verified(&path, &envelope, key, "backup", vault)?;
 
     let mut backups = fs::read_dir(&directory)
         .map_err(|e| error("자동 백업 폴더 읽기 실패", e))?
@@ -956,7 +1445,7 @@ fn add_parsed(
             brand_icon: None,
             favorite: false,
         });
-        save_local(app, key, kdf, &vault)?;
+        save_local(app, key, kdf, &mut vault)?;
         Ok(view)
     })
 }
@@ -1006,7 +1495,7 @@ fn add_many(
         if added == 0 {
             return Err("QR의 모든 인증키가 이미 등록되어 있습니다.".into());
         }
-        save_local(app, key, kdf, &vault)?;
+        save_local(app, key, kdf, &mut vault)?;
         Ok(ImportSummary {
             added,
             skipped,
@@ -1146,8 +1635,7 @@ async fn unlock_with_biometric(
         .try_into()
         .map_err(|_| "OS 보호 저장소의 금고 키가 손상되었습니다.".to_string())?;
     let key = Zeroizing::new(key_bytes);
-    let envelope = read_envelope(&vault_path(&app)?)?;
-    let _verified = decrypt_vault(&envelope, &key, "vault")?;
+    let _verified = load_local(&app, &key)?;
     let mut guard = state
         .session
         .lock()
@@ -1189,10 +1677,9 @@ fn initialize_vault(
     if path.exists() {
         return Err("이미 금고가 존재합니다.".into());
     }
-    let kdf = new_kdf_config()?;
-    let key = derive_key(password.as_bytes(), &kdf)?;
-    let envelope = encrypt_vault(&Vault::default(), &key, kdf, "vault")?;
-    atomic_write(&path, &envelope)?;
+    let vault = Vault::default();
+    let (envelope, key) = create_v2_envelope(&vault, password.as_bytes(), "vault")?;
+    atomic_write_verified(&path, &envelope, &key, "vault", &vault)?;
     let mut guard = state
         .session
         .lock()
@@ -1213,9 +1700,22 @@ fn unlock_vault(
 ) -> CommandResult<()> {
     require_window(&window, "main")?;
     let password = Zeroizing::new(password);
-    let envelope = read_envelope(&vault_path(&app)?)?;
-    let key = derive_key(password.as_bytes(), &envelope.kdf)?;
-    let _verified = decrypt_vault(&envelope, &key, "vault")?;
+    let path = vault_path(&app)?;
+    let (envelope, vault, mut key) = unlock_local_with_password(&app, password.as_bytes())?;
+    if envelope.version == 1 {
+        let (migrated, migrated_key) = create_v2_envelope(&vault, password.as_bytes(), "vault")?;
+        atomic_write_verified(&path, &migrated, &migrated_key, "vault", &vault)?;
+        if vault.backup.automatic_file {
+            let context = crypto_context(&migrated)?;
+            write_automatic_file_backup(&vault, &migrated_key, &context)?;
+        }
+        key = migrated_key;
+        let marker = biometric_marker_path(&app)?;
+        if marker.exists() {
+            let _ = platform_biometric::delete();
+            let _ = fs::remove_file(marker);
+        }
+    }
     let mut guard = state
         .session
         .lock()
@@ -1234,6 +1734,10 @@ fn lock_vault(window: WebviewWindow, state: State<'_, AppState>) -> CommandResul
         .session
         .lock()
         .map_err(|_| "보안 상태 잠금 오류".to_string())? = None;
+    *state
+        .pending_restore
+        .lock()
+        .map_err(|_| "복구 상태 잠금 오류".to_string())? = None;
     Ok(())
 }
 
@@ -1344,7 +1848,7 @@ fn delete_entry(
         if vault.entries.len() == before {
             return Err("삭제할 항목을 찾지 못했습니다.".into());
         }
-        save_local(&app, key, kdf, &vault)
+        save_local(&app, key, kdf, &mut vault)
     })
 }
 
@@ -1365,7 +1869,7 @@ fn set_entry_favorite(
             .find(|entry| entry.id == id)
             .ok_or_else(|| "수정할 항목을 찾지 못했습니다.".to_string())?;
         entry.favorite = favorite;
-        save_local(&app, key, kdf, &vault)
+        save_local(&app, key, kdf, &mut vault)
     })
 }
 
@@ -1416,7 +1920,7 @@ fn reorder_entries(
             .into_iter()
             .map(|slot| slot.unwrap_or_else(|| reordered.next().expect("validated reorder slots")))
             .collect();
-        save_local(&app, key, kdf, &vault)
+        save_local(&app, key, kdf, &mut vault)
     })
 }
 
@@ -1478,7 +1982,7 @@ fn update_entry(
         entry.account = account;
         entry.brand_icon = brand_icon;
         entry.icon = icon;
-        save_local(&app, key, kdf, &vault)
+        save_local(&app, key, kdf, &mut vault)
     })
 }
 
@@ -1681,6 +2185,9 @@ fn get_backup_status(
                 healthy: false,
                 file_count: 0,
                 last_backup_at: None,
+                entry_count: None,
+                size_bytes: None,
+                sha256: None,
                 message: "자동 백업이 꺼져 있습니다.".into(),
             });
         }
@@ -1691,6 +2198,9 @@ fn get_backup_status(
                 healthy: false,
                 file_count: 0,
                 last_backup_at: None,
+                entry_count: None,
+                size_bytes: None,
+                sha256: None,
                 message: "백업 폴더를 찾을 수 없습니다.".into(),
             });
         }
@@ -1713,11 +2223,16 @@ fn get_backup_status(
                 healthy: false,
                 file_count: 0,
                 last_backup_at: None,
+                entry_count: None,
+                size_bytes: None,
+                sha256: None,
                 message: "아직 생성된 자동 백업이 없습니다.".into(),
             });
         };
         let envelope = read_envelope(latest)?;
-        decrypt_vault(&envelope, key, "backup")?;
+        let verified = decrypt_vault(&envelope, key, "backup")?;
+        let size_bytes = latest.metadata().ok().map(|metadata| metadata.len());
+        let sha256 = file_sha256(latest).ok();
         let last_backup_at = latest
             .metadata()
             .ok()
@@ -1729,6 +2244,9 @@ fn get_backup_status(
             healthy: true,
             file_count: backups.len(),
             last_backup_at,
+            entry_count: Some(verified.entries.len()),
+            size_bytes,
+            sha256,
             message: "최근 백업의 무결성을 확인했습니다.".into(),
         })
     })
@@ -1778,7 +2296,7 @@ fn save_backup_settings(
         vault.backup.automatic_file = automatic_file;
         vault.backup.directory = directory;
         vault.backup.retention = retention;
-        save_local(&app, key, kdf, &vault)
+        save_local(&app, key, kdf, &mut vault)
     })
 }
 
@@ -1792,11 +2310,10 @@ async fn export_backup(
     require_window(&window, "main")?;
     let password = Zeroizing::new(password);
     validate_password(&password)?;
-    let envelope = with_session(&state, |key| {
+    let (envelope, backup_key, vault) = with_session(&state, |key| {
         let (vault, _) = load_local(&app, key)?;
-        let kdf = new_kdf_config()?;
-        let backup_key = derive_key(password.as_bytes(), &kdf)?;
-        encrypt_vault(&vault, &backup_key, kdf, "backup")
+        let (envelope, backup_key) = create_v2_envelope(&vault, password.as_bytes(), "backup")?;
+        Ok((envelope, backup_key, vault))
     })?;
     let (sender, receiver) = tokio::sync::oneshot::channel();
     app.dialog()
@@ -1815,18 +2332,19 @@ async fn export_backup(
     let path = path
         .into_path()
         .map_err(|_| "선택한 경로를 사용할 수 없습니다.".to_string())?;
-    atomic_write(&path, &envelope)?;
+    atomic_write_verified(&path, &envelope, &backup_key, "backup", &vault)?;
     Ok(true)
 }
 
 #[tauri::command]
-async fn import_backup(
+async fn preview_backup_restore(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, AppState>,
     password: String,
-) -> CommandResult<Option<usize>> {
+) -> CommandResult<Option<RestorePreview>> {
     require_window(&window, "main")?;
+    with_session(&state, |_| Ok(()))?;
     let password = Zeroizing::new(password);
     let (sender, receiver) = tokio::sync::oneshot::channel();
     app.dialog()
@@ -1845,16 +2363,120 @@ async fn import_backup(
         .into_path()
         .map_err(|_| "선택한 경로를 사용할 수 없습니다.".to_string())?;
     let backup = read_envelope(&path)?;
-    let backup_key = derive_key(password.as_bytes(), &backup.kdf)?;
-    let imported = decrypt_vault(&backup, &backup_key, "backup")?;
-    let restored_entries = with_session(&state, |current_key| {
-        let (local, local_kdf) = load_local(&app, current_key)?;
-        let (restored, restored_entries) = prepare_restored_vault(imported, local);
-        let envelope = encrypt_vault(&restored, current_key, local_kdf, "vault")?;
-        atomic_write(&vault_path(&app)?, &envelope)?;
-        Ok(restored_entries)
+    let (imported, _) = unlock_envelope(&backup, password.as_bytes(), "backup")?;
+    let token = Uuid::new_v4();
+    let preview = with_session(&state, |current_key| {
+        let (local, _) = load_local(&app, current_key)?;
+        Ok(make_restore_preview(token, &imported, &local))
     })?;
-    Ok(Some(restored_entries))
+    let mut pending = state
+        .pending_restore
+        .lock()
+        .map_err(|_| "복구 상태 잠금 오류".to_string())?;
+    *pending = Some(PendingRestore {
+        token,
+        vault: imported,
+        created_at: Instant::now(),
+    });
+    drop(pending);
+    let pending_restore = Arc::clone(&state.pending_restore);
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(10 * 60)).await;
+        if let Ok(mut guard) = pending_restore.lock() {
+            if guard.as_ref().is_some_and(|pending| pending.token == token) {
+                *guard = None;
+            }
+        }
+    });
+    Ok(Some(preview))
+}
+
+#[tauri::command]
+fn apply_backup_restore(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    token: Uuid,
+    mode: String,
+) -> CommandResult<RestoreResult> {
+    require_window(&window, "main")?;
+    if mode != "merge" && mode != "replace" {
+        return Err("복구 방식은 merge 또는 replace여야 합니다.".into());
+    }
+    let mut pending = {
+        let mut guard = state
+            .pending_restore
+            .lock()
+            .map_err(|_| "복구 상태 잠금 오류".to_string())?;
+        let pending = guard
+            .take()
+            .ok_or_else(|| "복구 미리보기가 만료되었습니다.".to_string())?;
+        if pending.token != token || pending.created_at.elapsed() > Duration::from_secs(10 * 60) {
+            return Err("복구 미리보기가 만료되었습니다. 파일을 다시 선택해 주세요.".into());
+        }
+        pending
+    };
+
+    with_session(&state, |current_key| {
+        let path = vault_path(&app)?;
+        let (mut local, context) = load_local(&app, current_key)?;
+
+        let recovery_path = path.with_file_name("vault.pre-restore.dat");
+        let current_envelope = match &context {
+            VaultCryptoContext::Legacy(kdf) => {
+                encrypt_vault_legacy(&local, current_key, kdf.clone(), "vault")?
+            }
+            VaultCryptoContext::Envelope { .. } => {
+                encrypt_vault_v2(&local, current_key, &context, "vault")?
+            }
+        };
+        atomic_write_verified(
+            &recovery_path,
+            &current_envelope,
+            current_key,
+            "vault",
+            &local,
+        )?;
+
+        let mut skipped_entries = 0;
+        let restored_entries;
+        if mode == "replace" {
+            let (restored, count) = prepare_restored_vault(pending.vault, local);
+            local = restored;
+            restored_entries = count;
+        } else {
+            let mut existing_ids = local
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<HashSet<_>>();
+            let mut added = 0;
+            for mut entry in std::mem::take(&mut pending.vault.entries) {
+                if local
+                    .entries
+                    .iter()
+                    .any(|current| same_entry(current, &entry))
+                {
+                    skipped_entries += 1;
+                    continue;
+                }
+                if existing_ids.contains(&entry.id) {
+                    entry.id = Uuid::new_v4();
+                }
+                existing_ids.insert(entry.id);
+                local.entries.push(entry);
+                added += 1;
+            }
+            restored_entries = added;
+        }
+
+        save_local(&app, current_key, context, &mut local)?;
+        Ok(RestoreResult {
+            restored_entries,
+            skipped_entries,
+            mode,
+        })
+    })
 }
 
 #[tauri::command]
@@ -2015,7 +2637,8 @@ pub fn run() {
             choose_backup_directory,
             save_backup_settings,
             export_backup,
-            import_backup,
+            preview_backup_restore,
+            apply_backup_restore,
             open_scanner,
             close_scanner,
             scan_screen_region
@@ -2047,16 +2670,51 @@ mod tests {
 
     #[test]
     fn encryption_round_trip_and_tamper_detection() {
-        let kdf = new_kdf_config().unwrap();
-        let key = derive_key(b"correct horse battery staple", &kdf).unwrap();
         let vault = Vault {
             entries: vec![],
             backup: BackupSettings::default(),
+            ..Vault::default()
         };
-        let mut envelope = encrypt_vault(&vault, &key, kdf, "vault").unwrap();
+        let (mut envelope, key) =
+            create_v2_envelope(&vault, b"correct horse battery staple", "vault").unwrap();
         assert!(decrypt_vault(&envelope, &key, "vault").is_ok());
         envelope.ciphertext.push('A');
         assert!(decrypt_vault(&envelope, &key, "vault").is_err());
+    }
+
+    #[test]
+    fn v2_wraps_random_data_key_and_rejects_wrong_password() {
+        let vault = Vault::default();
+        let (envelope, data_key) =
+            create_v2_envelope(&vault, b"correct horse battery staple", "vault").unwrap();
+        assert_eq!(envelope.version, VAULT_FORMAT_VERSION);
+        assert!(envelope.wrapped_key.is_some());
+        assert!(envelope.key_nonce.is_some());
+        let (_, unlocked_key) =
+            unlock_envelope(&envelope, b"correct horse battery staple", "vault").unwrap();
+        assert_eq!(data_key.as_slice(), unlocked_key.as_slice());
+        assert!(unlock_envelope(&envelope, b"wrong password value", "vault").is_err());
+    }
+
+    #[test]
+    fn legacy_v1_envelope_remains_readable() {
+        let vault = Vault::default();
+        let kdf = new_kdf_config().unwrap();
+        let legacy_key = derive_key(b"correct horse battery staple", &kdf).unwrap();
+        let envelope = encrypt_vault_legacy(&vault, &legacy_key, kdf, "vault").unwrap();
+        let (restored, restored_key) =
+            unlock_envelope(&envelope, b"correct horse battery staple", "vault").unwrap();
+        assert_eq!(restored.vault_id, vault.vault_id);
+        assert_eq!(restored_key.as_slice(), legacy_key.as_slice());
+    }
+
+    #[test]
+    fn legacy_vault_payload_receives_v2_metadata_defaults() {
+        let legacy =
+            br#"{"entries":[],"backup":{"automatic_file":false,"directory":"","retention":10}}"#;
+        let vault: Vault = serde_json::from_slice(legacy).unwrap();
+        assert!(!vault.vault_id.is_nil());
+        assert_eq!(vault.revision, 0);
     }
 
     #[test]
@@ -2079,8 +2737,12 @@ mod tests {
                 directory: "missing-remote-folder".into(),
                 retention: 99,
             },
+            ..Vault::default()
         };
+        let local_id = Uuid::new_v4();
         let local = Vault {
+            vault_id: local_id,
+            revision: 12,
             entries: vec![],
             backup: BackupSettings {
                 automatic_file: false,
@@ -2093,9 +2755,65 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(restored.entries[0].issuer, "GitHub");
+        assert_eq!(restored.vault_id, local_id);
+        assert_eq!(restored.revision, 12);
         assert!(!restored.backup.automatic_file);
         assert_eq!(restored.backup.directory, "local-folder");
         assert_eq!(restored.backup.retention, 7);
+    }
+
+    #[test]
+    fn restore_preview_classifies_duplicates_and_conflicts() {
+        let make_entry = |secret: &str| OtpEntry {
+            id: Uuid::new_v4(),
+            issuer: "GitHub".into(),
+            account: "octocat".into(),
+            secret: secret.into(),
+            algorithm: TotpAlgorithm::Sha1,
+            digits: 6,
+            period: 30,
+            icon: None,
+            brand_icon: None,
+            favorite: false,
+        };
+        let local = Vault {
+            vault_id: new_vault_id(),
+            revision: 0,
+            entries: vec![make_entry("JBSWY3DPEHPK3PXP")],
+            backup: BackupSettings::default(),
+        };
+        let imported = Vault {
+            vault_id: new_vault_id(),
+            revision: 0,
+            entries: vec![
+                make_entry("JBSWY3DPEHPK3PXP"),
+                make_entry("GEZDGNBVGY3TQOJQ"),
+            ],
+            backup: BackupSettings::default(),
+        };
+        let preview = make_restore_preview(Uuid::new_v4(), &imported, &local);
+        assert_eq!(preview.duplicate_entries, 1);
+        assert_eq!(preview.conflicting_entries, 1);
+        assert_eq!(preview.new_entries, 0);
+    }
+
+    #[test]
+    fn atomic_write_verifies_and_keeps_previous_generation() {
+        let directory = std::env::temp_dir().join(format!("secretary-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("vault.dat");
+        let mut vault = Vault::default();
+        let (first, key) =
+            create_v2_envelope(&vault, b"correct horse battery staple", "vault").unwrap();
+        atomic_write_verified(&path, &first, &key, "vault", &vault).unwrap();
+        let context = crypto_context(&first).unwrap();
+        vault.revision += 1;
+        let second = encrypt_vault_v2(&vault, &key, &context, "vault").unwrap();
+        atomic_write_verified(&path, &second, &key, "vault", &vault).unwrap();
+        assert!(backup_sidecar_path(&path).unwrap().exists());
+        let stored = read_envelope(&path).unwrap();
+        assert_eq!(decrypt_vault(&stored, &key, "vault").unwrap().revision, 1);
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

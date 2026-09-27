@@ -186,6 +186,25 @@ input:focus, textarea:focus { border-color: var(--hairline-strong); }
 .backup-status-title { color: var(--ink); font-size: 13px; font-weight: 600; }
 .backup-status p { margin: 4px 0 0; font-size: 12px; }
 .backup-status-meta { color: var(--ash); }
+.restore-preview { min-height: 0; }
+.restore-summary { padding: 12px; background: var(--elevated); border-radius: 8px; }
+.restore-summary p { margin: 5px 0 0; font-size: 12px; }
+.restore-entry-list { max-height: 250px; overflow-y: auto; border-radius: 8px; background: var(--elevated); scrollbar-width: thin; scrollbar-color: #343638 transparent; }
+.restore-entry-list::-webkit-scrollbar { width: 5px; }
+.restore-entry-list::-webkit-scrollbar-button { display: none; }
+.restore-entry-list::-webkit-scrollbar-track { background: transparent; }
+.restore-entry-list::-webkit-scrollbar-thumb { background: #343638; border-radius: 999px; }
+.restore-entry { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 48px; padding: 8px 10px; border-bottom: 1px solid var(--hairline); }
+.restore-entry:last-child { border-bottom: 0; }
+.restore-entry-identity { min-width: 0; display: grid; gap: 2px; }
+.restore-entry-identity strong, .restore-entry-identity span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.restore-entry-identity span { font-size: 11px; }
+.restore-badge { flex: 0 0 auto; padding: 3px 7px; border-radius: 999px; color: var(--mute); background: var(--card); font-size: 11px; }
+.restore-badge.new { color: var(--accent-green); background: var(--accent-green-soft); }
+.restore-badge.conflict { color: var(--accent-yellow); background: var(--accent-yellow-soft); }
+.restore-warning, .restore-truncated { margin: 0; color: var(--mute); font-size: 12px; line-height: 1.5; }
+.restore-truncated { padding: 9px; text-align: center; }
+.restore-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .update-dialog-body { gap: 12px; }
 .update-version { margin: 0; color: #f4f4f6; font-size: 17px; font-weight: 600; }
 .update-notes { max-height: 220px; overflow: auto; padding: 12px; border: 1px solid #242728; border-radius: 8px; background: #101111; color: #cdcdcd; font-size: 14px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }

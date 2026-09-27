@@ -111,8 +111,25 @@ type BackupSettingsView = {
   automaticFile: boolean; directory: string; retention: number;
 };
 type BackupStatusView = {
-  configured: boolean; healthy: boolean; fileCount: number; lastBackupAt?: number | null; message: string;
+  configured: boolean;
+  healthy: boolean;
+  fileCount: number;
+  lastBackupAt?: number | null;
+  entryCount?: number | null;
+  sizeBytes?: number | null;
+  sha256?: string | null;
+  message: string;
 };
+type RestorePreviewEntry = { issuer: string; account: string; status: "new" | "duplicate" | "conflict" };
+type RestorePreview = {
+  token: string;
+  sourceEntries: number;
+  newEntries: number;
+  duplicateEntries: number;
+  conflictingEntries: number;
+  entries: RestorePreviewEntry[];
+};
+type RestoreResult = { restoredEntries: number; skippedEntries: number; mode: "merge" | "replace" };
 type BiometricStatus = { supported: boolean; enabled: boolean; method: string };
 
 const root = document.querySelector<HTMLDivElement>("#app")!;
@@ -603,10 +620,14 @@ async function backupCenterDialog() {
   const lastBackup = backupStatus.lastBackupAt
     ? new Date(backupStatus.lastBackupAt * 1000).toLocaleString()
     : "없음";
+  const verifiedDetails = backupStatus.healthy
+    ? `OTP ${backupStatus.entryCount ?? 0}개 · ${Math.ceil((backupStatus.sizeBytes ?? 0) / 1024)} KB · SHA-256 ${(backupStatus.sha256 ?? "").slice(0, 12)}…`
+    : `파일 ${backupStatus.fileCount}개 · 최근 백업 ${lastBackup}`;
   status.append(
     el("strong", "backup-status-title", statusTitle),
     el("p", "muted", backupStatus.message),
-    el("p", "backup-status-meta", `파일 ${backupStatus.fileCount}개 · 최근 백업 ${lastBackup}`),
+    el("p", "backup-status-meta", verifiedDetails),
+    ...(backupStatus.healthy ? [el("p", "backup-status-meta", `검증 시각 ${lastBackup}`)] : []),
   );
   const enabledLabel = el("label", "toggle-row");
   const enabled = el("input") as HTMLInputElement;
@@ -798,7 +819,7 @@ function backupDialog(mode: "export" | "import") {
   submit.type = "submit";
   form.append(el("p", "muted", mode === "export"
     ? "새 salt와 nonce로 다시 암호화된 .enc 파일을 만듭니다."
-    : "가져온 항목은 현재 열린 금고를 대체합니다."), password.field, submit);
+    : "파일을 검증한 뒤 항목을 미리 보고 병합 또는 전체 교체를 선택할 수 있습니다."), password.field, submit);
   const dialog = modal(mode === "export" ? "암호화 백업 내보내기" : "암호화 백업 복구", form);
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -812,19 +833,79 @@ function backupDialog(mode: "export" | "import") {
           toast("암호화 백업을 저장했습니다.");
         }
       } else {
-        const restoredEntries = await invoke<number | null>("import_backup", { password: pw.value });
+        const preview = await invoke<RestorePreview | null>("preview_backup_restore", { password: pw.value });
         pw.value = "";
-        if (restoredEntries !== null) {
+        if (preview !== null) {
           dialog.remove();
-          searchQuery = "";
-          await refreshCodes();
-          toast(`백업에서 인증키 ${restoredEntries}개를 복구했습니다.`);
+          restorePreviewDialog(preview);
         }
       }
     } catch (error) { toast(String(error), "error"); }
     finally { submit.disabled = false; }
   });
   pw.focus();
+}
+
+function restorePreviewDialog(preview: RestorePreview) {
+  const body = el("div", "stack restore-preview");
+  const summary = el("section", "restore-summary");
+  summary.append(
+    el("strong", "", `백업 OTP ${preview.sourceEntries}개`),
+    el("p", "muted", `새 항목 ${preview.newEntries}개 · 중복 ${preview.duplicateEntries}개 · 충돌 ${preview.conflictingEntries}개`),
+  );
+
+  const list = el("div", "restore-entry-list");
+  const labels: Record<RestorePreviewEntry["status"], string> = {
+    new: "새 항목",
+    duplicate: "중복",
+    conflict: "이름 충돌",
+  };
+  for (const entry of preview.entries) {
+    const row = el("div", "restore-entry");
+    const identity = el("div", "restore-entry-identity");
+    identity.append(el("strong", "", entry.issuer), el("span", "muted", entry.account));
+    row.append(identity, el("span", `restore-badge ${entry.status}`, labels[entry.status]));
+    list.append(row);
+  }
+  if (preview.sourceEntries > preview.entries.length) {
+    list.append(el("p", "restore-truncated", `외 ${preview.sourceEntries - preview.entries.length}개`));
+  }
+
+  const warning = el(
+    "p",
+    "restore-warning",
+    "복구 직전에 현재 금고가 vault.pre-restore.dat로 자동 보존됩니다. 비밀키는 이 화면에 표시되지 않습니다.",
+  );
+  const actions = el("div", "restore-actions");
+  const merge = el("button", "ghost", "중복 제외하고 병합") as HTMLButtonElement;
+  const replace = el("button", "primary", "현재 금고 전체 교체") as HTMLButtonElement;
+  merge.type = "button";
+  replace.type = "button";
+  actions.append(merge, replace);
+  body.append(summary, list, warning, actions);
+  const dialog = modal("백업 복구 미리보기", body);
+
+  const apply = async (mode: "merge" | "replace") => {
+    merge.disabled = true;
+    replace.disabled = true;
+    try {
+      const result = await invoke<RestoreResult>("apply_backup_restore", { token: preview.token, mode });
+      dialog.remove();
+      searchQuery = "";
+      await refreshCodes();
+      toast(
+        result.mode === "merge"
+          ? `${result.restoredEntries}개를 병합하고 중복 ${result.skippedEntries}개를 건너뛰었습니다.`
+          : `백업의 OTP ${result.restoredEntries}개로 금고를 교체했습니다.`,
+      );
+    } catch (error) {
+      toast(String(error), "error");
+      merge.disabled = false;
+      replace.disabled = false;
+    }
+  };
+  merge.addEventListener("click", () => void apply("merge"));
+  replace.addEventListener("click", () => void apply("replace"));
 }
 
 function editEntryDialog(item: CodeView) {
