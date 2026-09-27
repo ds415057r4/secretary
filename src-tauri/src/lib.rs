@@ -1065,85 +1065,6 @@ fn now_seconds() -> CommandResult<u64> {
         .map_err(|_| "시스템 시간이 올바르지 않습니다.".to_string())
 }
 
-fn secure_index(upper_bound: usize) -> CommandResult<usize> {
-    if upper_bound == 0 || upper_bound > 256 {
-        return Err("암호 문자 집합 크기가 올바르지 않습니다.".into());
-    }
-    let limit = 256 - (256 % upper_bound);
-    loop {
-        let byte = random_bytes::<1>()?[0] as usize;
-        if byte < limit {
-            return Ok(byte % upper_bound);
-        }
-    }
-}
-
-#[tauri::command]
-fn generate_password(
-    window: WebviewWindow,
-    length: usize,
-    lowercase: bool,
-    uppercase: bool,
-    digits: bool,
-    symbols: bool,
-) -> CommandResult<String> {
-    require_window(&window, "main")?;
-    if !(12..=128).contains(&length) {
-        return Err("암호 길이는 12~128자여야 합니다.".into());
-    }
-    let groups = [
-        (lowercase, b"abcdefghijklmnopqrstuvwxyz".as_slice()),
-        (uppercase, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ".as_slice()),
-        (digits, b"0123456789".as_slice()),
-        (symbols, b"!@#$%^&*()-_=+[]{}:,.?".as_slice()),
-    ];
-    let selected = groups
-        .iter()
-        .filter(|(enabled, _)| *enabled)
-        .map(|(_, chars)| *chars)
-        .collect::<Vec<_>>();
-    if selected.is_empty() {
-        return Err("하나 이상의 문자 종류를 선택하세요.".into());
-    }
-    let alphabet = selected
-        .iter()
-        .flat_map(|group| group.iter().copied())
-        .collect::<Vec<_>>();
-    let mut password = Zeroizing::new(Vec::with_capacity(length));
-    for group in &selected {
-        password.push(group[secure_index(group.len())?]);
-    }
-    while password.len() < length {
-        password.push(alphabet[secure_index(alphabet.len())?]);
-    }
-    for index in (1..password.len()).rev() {
-        let swap = secure_index(index + 1)?;
-        password.swap(index, swap);
-    }
-    let password = Zeroizing::new(
-        String::from_utf8(password.to_vec()).map_err(|_| "암호 생성 실패".to_string())?,
-    );
-    Ok(password.to_string())
-}
-
-#[tauri::command]
-fn copy_generated_password(
-    app: AppHandle,
-    window: WebviewWindow,
-    password: String,
-) -> CommandResult<()> {
-    require_window(&window, "main")?;
-    let password = Zeroizing::new(password);
-    if password.len() > 512 || password.is_empty() {
-        return Err("복사할 암호가 올바르지 않습니다.".into());
-    }
-    app.clipboard()
-        .write_text(password.to_string())
-        .map_err(|e| error("클립보드 쓰기 실패", e))?;
-    schedule_clipboard_clear(app, password);
-    Ok(())
-}
-
 #[tauri::command]
 fn vault_status(
     app: AppHandle,
@@ -1601,10 +1522,10 @@ async fn choose_entry_icon(app: AppHandle, window: WebviewWindow) -> CommandResu
         return Err("아이콘 이미지는 5MB 이하여야 합니다.".into());
     }
     let source = fs::read(&path).map_err(|e| error("아이콘 파일을 읽을 수 없습니다", e))?;
-    let image = decode_image_limited(&source, 4096, 96 * 1024 * 1024)
+    let image = decode_image_limited(&source, 2048, 32 * 1024 * 1024)
         .map_err(|e| error("지원하지 않거나 손상된 이미지", e))?;
-    if image.width() > 4096 || image.height() > 4096 {
-        return Err("아이콘 이미지 해상도는 4096×4096 이하여야 합니다.".into());
+    if image.width() > 2048 || image.height() > 2048 {
+        return Err("아이콘 이미지 해상도는 2048×2048 이하여야 합니다.".into());
     }
     let icon = image.thumbnail(128, 128);
     let mut encoded = Zeroizing::new(Vec::new());
@@ -1618,9 +1539,21 @@ async fn choose_entry_icon(app: AppHandle, window: WebviewWindow) -> CommandResu
 #[tauri::command]
 fn minimize_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<()> {
     require_window(&window, "main")?;
-    let mini = app
-        .get_webview_window("mini")
-        .ok_or_else(|| "미니 창을 찾을 수 없습니다.".to_string())?;
+    let mini = if let Some(existing) = app.get_webview_window("mini") {
+        existing
+    } else {
+        WebviewWindowBuilder::new(&app, "mini", WebviewUrl::App("index.html?mode=mini".into()))
+            .title("Secretary")
+            .decorations(false)
+            .transparent(true)
+            .background_color(tauri::utils::config::Color(0, 0, 0, 0))
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .resizable(false)
+            .visible(false)
+            .build()
+            .map_err(|e| error("미니 창 생성 실패", e))?
+    };
     let monitor = window
         .current_monitor()
         .map_err(|e| error("현재 모니터 확인 실패", e))?
@@ -1637,7 +1570,7 @@ fn minimize_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<
         .map_err(|e| error("미니 창 위치 설정 실패", e))?;
     mini.show().map_err(|e| error("미니 창 표시 실패", e))?;
     window.hide().map_err(|e| {
-        let _ = mini.hide();
+        let _ = mini.close();
         error("메인 창 숨기기 실패", e)
     })?;
     Ok(())
@@ -1689,7 +1622,9 @@ fn restore_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<(
     main.show().map_err(|e| error("메인 창 표시 실패", e))?;
     main.set_focus()
         .map_err(|e| error("메인 창 포커스 실패", e))?;
-    window.hide().map_err(|e| error("미니 창 숨기기 실패", e))
+    app.emit_to("main", "main-restored", ())
+        .map_err(|e| error("메인 창 갱신 이벤트 실패", e))?;
+    window.close().map_err(|e| error("미니 창 닫기 실패", e))
 }
 
 #[tauri::command]
@@ -1994,7 +1929,7 @@ fn scan_screen_region(
     height: u32,
 ) -> CommandResult<ImportSummary> {
     require_window(&window, "scanner")?;
-    if width < 24 || height < 24 || width > 8192 || height > 8192 {
+    if width < 24 || height < 24 || width > 4096 || height > 4096 {
         return Err("선택 영역 크기가 올바르지 않습니다.".into());
     }
     let tauri_monitor = window
@@ -2069,8 +2004,6 @@ pub fn run() {
             enable_biometric,
             unlock_with_biometric,
             disable_biometric,
-            generate_password,
-            copy_generated_password,
             initialize_vault,
             unlock_vault,
             lock_vault,

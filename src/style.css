@@ -194,11 +194,6 @@ input:focus, textarea:focus { border-color: var(--hairline-strong); }
 .update-progress::-webkit-progress-value { background: #f4f4f6; border-radius: 9999px; }
 .update-status { min-height: 20px; margin: 0; }
 .update-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.password-generator { margin-top: 18px; }
-.generated-password { font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace; font-size: 14px; }
-.password-length-row { display: grid; grid-template-columns: 1fr 96px; align-items: center; gap: 12px; color: var(--body); font-size: 13px; }
-.password-options { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 12px; }
-.password-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .biometric-unlock { margin-top: 2px; }
 .biometric-settings { justify-items: center; text-align: center; }
 .biometric-symbol { width: 52px; height: 52px; display: grid; place-items: center; color: var(--mute); background: var(--elevated); border: 1px solid var(--hairline); border-radius: 12px; }

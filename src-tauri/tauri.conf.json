@@ -27,26 +27,6 @@
         "shadow": false,
         "theme": "Dark",
         "center": true
-      },
-      {
-        "label": "mini",
-        "title": "Secretary",
-        "url": "index.html?mode=mini",
-        "width": 6,
-        "height": 6,
-        "minWidth": 6,
-        "minHeight": 6,
-        "maxWidth": 320,
-        "maxHeight": 410,
-        "resizable": false,
-        "decorations": false,
-        "transparent": true,
-        "shadow": false,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "visible": false,
-        "focus": false,
-        "theme": "Dark"
       }
     ],
     "security": {

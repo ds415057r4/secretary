@@ -5,8 +5,6 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   createElement as createLucideIcon,
-  Copy,
-  Dices,
   Download,
   Eye,
   EyeOff,
@@ -102,6 +100,7 @@ const axgateVpnLogo = new URL("./assets/brands/axgate-vpn.png", import.meta.url)
 const hunesionLogo = new URL("./assets/brands/hunesion.png", import.meta.url).href;
 let codes: CodeView[] = [];
 let refreshTimer: number | undefined;
+let refreshingCodes = false;
 let searchQuery = "";
 let dragInProgress = false;
 let draggedCard: HTMLElement | null = null;
@@ -305,6 +304,9 @@ function toast(message: string, kind: "ok" | "error" = "ok") {
 
 function passwordPanel(initialized: boolean) {
   vaultVisible = false;
+  codes = [];
+  if (refreshTimer) window.clearInterval(refreshTimer);
+  refreshTimer = undefined;
   root.replaceChildren();
   const titlebar = createTitlebar(false);
   titlebar.classList.add("auth-titlebar");
@@ -640,10 +642,6 @@ function showAddMenu(anchor: HTMLElement) {
       } catch (error) {
         toast(String(error), "error");
       }
-    }, "popup-menu-action"),
-    symbolButton("암호 생성", Dices, () => {
-      layer.remove();
-      passwordGeneratorDialog();
     }, "popup-menu-action")
   );
   layer.append(menu);
@@ -655,66 +653,6 @@ function showAddMenu(anchor: HTMLElement) {
   layer.addEventListener("pointerdown", (event) => {
     if (event.target === layer) layer.remove();
   });
-}
-
-function passwordGeneratorDialog() {
-  const body = el("section", "stack password-generator");
-  const output = el("input", "generated-password") as HTMLInputElement;
-  output.readOnly = true;
-  output.spellcheck = false;
-  output.setAttribute("aria-label", "생성된 암호");
-  const lengthRow = el("label", "password-length-row");
-  lengthRow.append(el("span", "", "길이"));
-  const length = el("input") as HTMLInputElement;
-  length.type = "number";
-  length.min = "12";
-  length.max = "128";
-  length.value = "24";
-  lengthRow.append(length);
-  const options = el("div", "password-options");
-  const option = (label: string, checked: boolean) => {
-    const wrapper = el("label", "toggle-row");
-    const input = el("input") as HTMLInputElement;
-    input.type = "checkbox";
-    input.checked = checked;
-    wrapper.append(input, el("span", "", label));
-    options.append(wrapper);
-    return input;
-  };
-  const lowercase = option("소문자", true);
-  const uppercase = option("대문자", true);
-  const digits = option("숫자", true);
-  const symbols = option("특수문자", true);
-  const actions = el("div", "password-actions");
-  const regenerate = symbolButton("다시 생성", RefreshCw, () => void generate(), "ghost");
-  const copy = symbolButton("복사", Copy, async () => {
-    if (!output.value) return;
-    try {
-      await invoke("copy_generated_password", { password: output.value });
-      toast("복사 완료");
-    } catch (error) { toast(String(error), "error"); }
-  }, "primary");
-  actions.append(regenerate, copy);
-  body.append(output, lengthRow, options, actions);
-  modal("암호 생성", body);
-
-  async function generate() {
-    regenerate.disabled = true;
-    try {
-      output.value = await invoke<string>("generate_password", {
-        length: Number(length.value),
-        lowercase: lowercase.checked,
-        uppercase: uppercase.checked,
-        digits: digits.checked,
-        symbols: symbols.checked,
-      });
-    } catch (error) {
-      toast(String(error), "error");
-    } finally {
-      regenerate.disabled = false;
-    }
-  }
-  void generate();
 }
 
 function createTitlebar(showLock: boolean) {
@@ -742,6 +680,8 @@ function createTitlebar(showLock: boolean) {
     minimizing = true;
     try {
       await invoke("minimize_main_window");
+      codes = [];
+      document.querySelector("#code-grid")?.replaceChildren();
     } catch (error) {
       toast(String(error), "error");
     } finally {
@@ -1157,14 +1097,69 @@ function renderCodes() {
   } else visible.forEach((item) => list.append(codeCard(item)));
 }
 
+function sameCodeStructure(previous: CodeView[], next: CodeView[]) {
+  return previous.length === next.length && previous.every((item, index) => {
+    const candidate = next[index];
+    return item.id === candidate.id
+      && item.issuer === candidate.issuer
+      && item.account === candidate.account
+      && item.period === candidate.period
+      && item.icon === candidate.icon
+      && item.brandIcon === candidate.brandIcon
+      && item.favorite === candidate.favorite;
+  });
+}
+
+function updateCodeValues() {
+  const circumference = 2 * Math.PI * 9;
+  for (const card of document.querySelectorAll<HTMLElement>("#code-grid .otp-card[data-entry-id]")) {
+    const item = codes.find((candidate) => candidate.id === card.dataset.entryId);
+    if (!item) continue;
+    const groups = card.querySelectorAll<HTMLElement>(".otp-group");
+    const splitAt = Math.floor(item.code.length / 2);
+    if (groups.length === 2) {
+      groups[0].textContent = item.code.slice(0, splitAt);
+      groups[1].textContent = item.code.slice(splitAt);
+    }
+    const expiring = item.remaining <= 5;
+    card.querySelector(".otp-code")?.classList.toggle("expiring", expiring);
+    const timer = card.querySelector<SVGElement>(".timer-ring");
+    timer?.classList.toggle("expiring", expiring);
+    const value = timer?.querySelector<SVGCircleElement>(".timer-value");
+    if (value) {
+      const ratio = Math.max(0, Math.min(1, item.remaining / item.period));
+      value.style.strokeDashoffset = `${circumference * (1 - ratio)}`;
+    }
+  }
+}
+
+function tickCodes() {
+  if (document.hidden || dragInProgress || refreshingCodes) return;
+  const now = Math.floor(Date.now() / 1000);
+  let rolledOver = false;
+  for (const item of codes) {
+    const remaining = item.period - (now % item.period);
+    if (remaining > item.remaining) rolledOver = true;
+    item.remaining = remaining;
+  }
+  if (rolledOver) void refreshCodes();
+  else updateCodeValues();
+}
+
 async function refreshCodes() {
-  if (dragInProgress) return;
+  if (dragInProgress || refreshingCodes) return;
+  refreshingCodes = true;
   try {
-    codes = await invoke<CodeView[]>("list_codes");
-    renderCodes();
+    const next = await invoke<CodeView[]>("list_codes");
+    const structureChanged = !sameCodeStructure(codes, next);
+    codes = next;
+    if (structureChanged) renderCodes();
+    else updateCodeValues();
   } catch {
     if (refreshTimer) window.clearInterval(refreshTimer);
     passwordPanel(true);
+  } finally {
+    refreshingCodes = false;
   }
 }
 
@@ -1194,7 +1189,7 @@ async function showVault() {
   root.append(page);
   await refreshCodes();
   if (refreshTimer) window.clearInterval(refreshTimer);
-  refreshTimer = window.setInterval(refreshCodes, 1000);
+  refreshTimer = window.setInterval(tickCodes, 1000);
 }
 
 async function scannerMode() {
@@ -1359,6 +1354,19 @@ function miniMode() {
     }
   };
 
+  const tickFavorites = () => {
+    if (!revealed || refreshingFavorites) return;
+    const now = Math.floor(Date.now() / 1000);
+    let rolledOver = false;
+    for (const item of favorites) {
+      const remaining = item.period - (now % item.period);
+      if (remaining > item.remaining) rolledOver = true;
+      item.remaining = remaining;
+    }
+    if (rolledOver) void refreshFavorites();
+    else updateFavoriteValues();
+  };
+
   const reveal = async () => {
     if (revealed) return;
     const id = ++transitionId;
@@ -1370,7 +1378,7 @@ function miniMode() {
         if (id !== transitionId) return;
         revealed = true;
         renderFavorites();
-        miniTimer = window.setInterval(() => void refreshFavorites(), 1000);
+        miniTimer = window.setInterval(tickFavorites, 1000);
       });
     } catch (error) {
       await invoke("restore_main_window");
@@ -1387,6 +1395,7 @@ function miniMode() {
     try {
       await invoke("set_mini_revealed", { revealed: false });
       root.classList.remove("mini-concealing");
+      favorites = [];
       root.replaceChildren(button);
     } catch (error) {
       toast(String(error), "error");
@@ -1418,6 +1427,9 @@ async function bootstrap() {
       : "";
     const legacy = event.payload.weakSecrets ? ` · 레거시 짧은 Secret ${event.payload.weakSecrets}개` : "";
     toast(`인증키 ${event.payload.added}개를 추가했습니다${skipped}${legacy}${batch}`);
+  });
+  await listen("main-restored", () => {
+    if (vaultVisible) void refreshCodes();
   });
   const status = await invoke<VaultStatus>("vault_status");
   status.unlocked ? await showVault() : passwordPanel(status.initialized);
