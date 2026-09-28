@@ -1,0 +1,260 @@
+name: Build signed release bundles
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to rebuild
+        required: true
+        default: v0.1.9
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+
+jobs:
+  windows:
+    name: Build signed Windows installers
+    runs-on: windows-latest
+    steps:
+      - name: Check out released revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build signed Windows installers
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri -- build --bundles nsis,msi
+
+      - name: Validate Windows updater artifacts
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem src-tauri/target/release/bundle/msi -Filter *.msi -File
+          $nsis = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe -File
+          if ($msi.Count -ne 1 -or $nsis.Count -ne 1) {
+            throw "Expected exactly one MSI and one NSIS installer."
+          }
+          foreach ($installer in @($msi[0], $nsis[0])) {
+            $signature = "$($installer.FullName).sig"
+            if (!(Test-Path -LiteralPath $signature) -or (Get-Item $signature).Length -eq 0) {
+              throw "Missing updater signature for $($installer.Name)"
+            }
+          }
+
+      - name: Upload Windows workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.msi.sig
+          if-no-files-found: error
+
+      - name: Attach Windows installers and signatures
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.msi.sig
+          fail_on_unmatched_files: true
+
+  macos:
+    name: Build signed universal macOS bundles
+    runs-on: macos-latest
+    steps:
+      - name: Check out released revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build signed universal updater and DMG
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri -- build --target universal-apple-darwin --bundles dmg
+
+      - name: Verify updater archive and repair DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_root="src-tauri/target/universal-apple-darwin/release/bundle"
+          updater_archive="$(find "$bundle_root/macos" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)"
+          updater_signature="${updater_archive}.sig"
+          dmg_path="$(find "$bundle_root/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -s "$updater_archive"
+          test -s "$updater_signature"
+          test -s "$dmg_path"
+
+          updater_staging="$(mktemp -d)"
+          tar -xzf "$updater_archive" -C "$updater_staging"
+          updater_app="$(find "$updater_staging" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          updater_executable="$updater_app/Contents/MacOS/secretary"
+          test -x "$updater_executable"
+          updater_rpaths="$(otool -l "$updater_executable" | awk '/LC_RPATH/{getline; getline; print $2}')"
+          grep -Fxq '/usr/lib/swift' <<<"$updater_rpaths"
+          grep -Fxq '@executable_path/../Frameworks' <<<"$updater_rpaths"
+          codesign --verify --deep --strict "$updater_app"
+          rm -rf "$updater_staging"
+
+          mount_point="$(mktemp -d)"
+          dmg_staging="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+            rm -rf "$mount_point" "$dmg_staging"
+          }
+          trap cleanup EXIT
+
+          hdiutil attach "$dmg_path" -nobrowse -readonly -mountpoint "$mount_point"
+          cp -R "$mount_point/Secretary.app" "$dmg_staging/Secretary.app"
+          hdiutil detach "$mount_point"
+
+          app="$dmg_staging/Secretary.app"
+          executable="$app/Contents/MacOS/secretary"
+          rpaths="$(otool -l "$executable" | awk '/LC_RPATH/{getline; getline; print $2}')"
+          if ! grep -Fxq '/usr/lib/swift' <<<"$rpaths"; then
+            install_name_tool -add_rpath /usr/lib/swift "$executable"
+          fi
+          if ! grep -Fxq '@executable_path/../Frameworks' <<<"$rpaths"; then
+            install_name_tool -add_rpath '@executable_path/../Frameworks' "$executable"
+          fi
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          ln -s /Applications "$dmg_staging/Applications"
+          rm -f "$dmg_path"
+          hdiutil create -volname Secretary -srcfolder "$dmg_staging" -ov -format UDZO "$dmg_path"
+
+      - name: Upload macOS workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+          if-no-files-found: error
+
+      - name: Attach macOS bundles and signature
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+          fail_on_unmatched_files: true
+
+  updater-manifest:
+    name: Publish verified latest.json
+    runs-on: ubuntu-latest
+    needs: [windows, macos]
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: artifacts/windows
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-release
+          path: artifacts/macos
+
+      - name: Build and upload updater manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          version="${tag#v}"
+          msi="$(find artifacts/windows -type f -name '*.msi' -print -quit)"
+          mac_archive="$(find artifacts/macos -type f -name '*.app.tar.gz' -print -quit)"
+          test -s "$msi"
+          test -s "${msi}.sig"
+          test -s "$mac_archive"
+          test -s "${mac_archive}.sig"
+
+          windows_signature="$(tr -d '\r\n' < "${msi}.sig")"
+          mac_signature="$(tr -d '\r\n' < "${mac_archive}.sig")"
+          windows_name="$(basename "$msi")"
+          mac_name="$(basename "$mac_archive")"
+          windows_url="https://github.com/$REPOSITORY/releases/download/$tag/$windows_name"
+          mac_url="https://github.com/$REPOSITORY/releases/download/$tag/$mac_name"
+          published_at="$(gh release view "$tag" --repo "$REPOSITORY" --json publishedAt --jq .publishedAt)"
+          gh release view "$tag" --repo "$REPOSITORY" --json body --jq .body > release-notes.txt
+
+          jq -n \
+            --arg version "$version" \
+            --arg pub_date "$published_at" \
+            --rawfile notes release-notes.txt \
+            --arg windows_url "$windows_url" \
+            --arg windows_signature "$windows_signature" \
+            --arg mac_url "$mac_url" \
+            --arg mac_signature "$mac_signature" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "windows-x86_64": { url: $windows_url, signature: $windows_signature },
+                "darwin-x86_64": { url: $mac_url, signature: $mac_signature },
+                "darwin-aarch64": { url: $mac_url, signature: $mac_signature }
+              }
+            }' > latest.json
+
+          jq -e '
+            (.version | length > 0) and
+            (.platforms | length == 3) and
+            ([.platforms[] | (.url | startswith("https://")) and (.signature | length > 0)] | all)
+          ' latest.json >/dev/null
+          gh release upload "$tag" latest.json --repo "$REPOSITORY" --clobber
