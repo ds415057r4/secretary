@@ -1,6 +1,6 @@
 [package]
 name = "secretary"
-version = "0.1.7"
+version = "0.1.8"
 description = "Secretary encrypted authenticator"
 authors = ["you"]
 edition = "2021"
@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api"] }
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }

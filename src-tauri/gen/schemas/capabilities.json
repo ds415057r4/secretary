@@ -1,1 +1,1 @@
-{"main-capability":{"identifier":"main-capability","description":"Minimal core permissions for the bundled local UI","local":true,"windows":["main","scanner","mini"],"permissions":["core:default","core:window:allow-start-dragging","updater:default","process:allow-restart"]}}
+{"main-capability":{"identifier":"main-capability","description":"Minimal core permissions for the bundled local UI","local":true,"windows":["main","scanner"],"permissions":["core:default","core:window:allow-start-dragging","updater:default","process:allow-restart"]}}

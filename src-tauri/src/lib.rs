@@ -22,7 +22,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{
+    menu::MenuBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use url::Url;
@@ -1800,25 +1804,6 @@ fn list_codes(
 }
 
 #[tauri::command]
-fn list_favorite_codes(
-    app: AppHandle,
-    window: WebviewWindow,
-    state: State<'_, AppState>,
-) -> CommandResult<Vec<CodeView>> {
-    require_window(&window, "mini")?;
-    with_session(&state, |key| {
-        let (vault, _) = load_local(&app, key)?;
-        let now = now_seconds()?;
-        vault
-            .entries
-            .iter()
-            .filter(|entry| entry.favorite)
-            .map(|entry| code_view(entry, now))
-            .collect()
-    })
-}
-
-#[tauri::command]
 fn add_otpauth_uri(
     app: AppHandle,
     window: WebviewWindow,
@@ -2039,82 +2024,18 @@ async fn choose_entry_icon(app: AppHandle, window: WebviewWindow) -> CommandResu
 }
 
 #[tauri::command]
-fn minimize_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<()> {
+fn minimize_main_window(window: WebviewWindow) -> CommandResult<()> {
     require_window(&window, "main")?;
-    let mini = app
-        .get_webview_window("mini")
-        .ok_or_else(|| "미니 창을 찾을 수 없습니다.".to_string())?;
-    let monitor = window
-        .current_monitor()
-        .map_err(|e| error("현재 모니터 확인 실패", e))?
-        .ok_or_else(|| "현재 모니터를 찾을 수 없습니다.".to_string())?;
-    let work_area = monitor.work_area();
-    mini.set_size(tauri::LogicalSize::new(6.0, 6.0))
-        .map_err(|e| error("미니 창 크기 설정 실패", e))?;
-    let mini_size = mini
-        .outer_size()
-        .map_err(|e| error("미니 창 크기 확인 실패", e))?;
-    let x = work_area.position.x + work_area.size.width as i32 - mini_size.width as i32;
-    let y = work_area.position.y;
-    mini.set_position(tauri::PhysicalPosition::new(x, y))
-        .map_err(|e| error("미니 창 위치 설정 실패", e))?;
-    mini.show().map_err(|e| error("미니 창 표시 실패", e))?;
-    window.hide().map_err(|e| {
-        let _ = mini.hide();
-        error("메인 창 숨기기 실패", e)
-    })?;
-    Ok(())
+    window.hide().map_err(|e| error("메인 창 숨기기 실패", e))
 }
 
-#[tauri::command]
-fn set_mini_revealed(
-    window: WebviewWindow,
-    revealed: bool,
-    item_count: Option<u32>,
-) -> CommandResult<()> {
-    require_window(&window, "mini")?;
-    let monitor = window
-        .current_monitor()
-        .map_err(|e| error("현재 모니터 확인 실패", e))?
-        .ok_or_else(|| "현재 모니터를 찾을 수 없습니다.".to_string())?;
-    let work_area = monitor.work_area();
-    let (width, height) = if revealed {
-        let count = item_count.unwrap_or(0).min(6) as f64;
-        (
-            320.0,
-            if count == 0.0 {
-                104.0
-            } else {
-                50.0 + count * 60.0
-            },
-        )
-    } else {
-        (6.0, 6.0)
-    };
-    window
-        .set_size(tauri::LogicalSize::new(width, height))
-        .map_err(|e| error("미니 창 크기 설정 실패", e))?;
-    let size = window
-        .outer_size()
-        .map_err(|e| error("미니 창 크기 확인 실패", e))?;
-    let x = work_area.position.x + work_area.size.width as i32 - size.width as i32;
-    window
-        .set_position(tauri::PhysicalPosition::new(x, work_area.position.y))
-        .map_err(|e| error("미니 창 위치 설정 실패", e))
-}
-
-#[tauri::command]
-fn restore_main_window(app: AppHandle, window: WebviewWindow) -> CommandResult<()> {
-    require_window(&window, "mini")?;
-    let main = app
-        .get_webview_window("main")
-        .ok_or_else(|| "메인 창을 찾을 수 없습니다.".to_string())?;
-    main.show().map_err(|e| error("메인 창 표시 실패", e))?;
-    main.set_focus()
-        .map_err(|e| error("메인 창 포커스 실패", e))?;
-    app.emit_to("main", "main-restored", ())
-        .map_err(|e| error("메인 창 갱신 이벤트 실패", e))?;
-    window.hide().map_err(|e| error("미니 창 숨기기 실패", e))
+fn restore_main_window(app: &AppHandle) {
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.unminimize();
+        let _ = main.set_focus();
+        let _ = app.emit_to("main", "main-restored", ());
+    }
 }
 
 #[tauri::command]
@@ -2131,9 +2052,7 @@ fn copy_code(
     state: State<'_, AppState>,
     id: Uuid,
 ) -> CommandResult<()> {
-    if window.label() != "main" && window.label() != "mini" {
-        return Err("허용되지 않은 창에서 호출했습니다.".into());
-    }
+    require_window(&window, "main")?;
     let code = with_session(&state, |key| {
         let (vault, _) = load_local(&app, key)?;
         let entry = vault
@@ -2593,20 +2512,46 @@ fn scan_screen_region(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
-            if let Some(mini) = app.get_webview_window("mini") {
-                let _ = mini.hide();
-            }
+            restore_main_window(app);
         }))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::default())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let menu = MenuBuilder::new(app)
+                .text("open", "Secretary 열기")
+                .separator()
+                .text("quit", "종료")
+                .build()?;
+            let icon = app
+                .default_window_icon()
+                .cloned()
+                .ok_or("앱 아이콘을 찾을 수 없습니다.")?;
+            TrayIconBuilder::new()
+                .icon(icon)
+                .tooltip("Secretary")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        restore_main_window(tray.app_handle());
+                    }
+                })
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "open" => restore_main_window(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .build(app)?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             vault_status,
             biometric_status,
@@ -2618,7 +2563,6 @@ pub fn run() {
             lock_vault,
             touch_session,
             list_codes,
-            list_favorite_codes,
             add_otpauth_uri,
             delete_entry,
             set_entry_favorite,
@@ -2626,8 +2570,6 @@ pub fn run() {
             update_entry,
             choose_entry_icon,
             minimize_main_window,
-            set_mini_revealed,
-            restore_main_window,
             close_main_window,
             copy_code,
             get_backup_settings,
